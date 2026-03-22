@@ -226,8 +226,53 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 ## Layer Properties (per-View Layer Config)
 
 Ανοίγει με "Layer Properties" button σε κάθε View card → `openViewEditModal(viewId)`.
-Δείχνει μόνο τα layers που τέμνουν το view box (`intersectingLayersForView`).
-Η σειρά layers αποθηκεύεται στο `view.layerOrder[]` — ανεξάρτητη per-view σειρά.
+Τίτλος modal: **"Drawings in View"**.
+Δείχνει μόνο τα layers που τέμνουν το view box (`intersectingLayersForView`), ομαδοποιημένα ανά Drawing.
+
+**Draft structure** (`state.viewEditDraft`):
+```js
+{
+  viewId,
+  drawingGroups: [
+    {
+      drawingId,
+      name,
+      collapsed,   // bool — default: πρώτο group open, υπόλοιπα collapsed
+      items: [{ layerId, baseElevation, height, color, opacity, outline, outlineColor, outlineWidth, excludeFromSectionCut, name }]
+    }
+  ]
+}
+```
+Αντικατέστησε το παλιό `draft.items[]` (flat list).
+
+**Persisted fields στο view:**
+- `view.layerOrder[]` — per-view σειρά layers (ανεξάρτητη)
+- `view.drawingOrder[]` — **νέο** per-view σειρά drawings (persisted κατά Apply)
+
+**Drawing cards στο modal:**
+- Collapsed state: background `var(--surface)`, border `var(--line)`
+- Expanded state: background `var(--accent-soft)`, border `var(--line-strong)`
+- Default: πρώτο drawing ανοιχτό, υπόλοιπα collapsed
+
+**Drawing header fields** (ευθυγραμμισμένα με τις στήλες των layer rows):
+- **Height** — readonly input, `computeDrawingEnd() - computeDrawingStart()`, snapped
+- **Start** — editable, shifts all layers by delta (preserving relative positions)
+- **End** — editable, shifts all layers by delta (preserving relative positions)
+- `shiftAllLayers(delta)`: mutates `it.baseElevation` για κάθε item στο group, ενημερώνει live τα `baseInput` + `syncEndFromBase` για κάθε layer row
+
+**`buildViewEditLayerRow(item, group, onchange)`:**
+- Επιστρέφει `{ row, baseInput, syncEndFromBase }` (αντί για απλό `row`)
+- `onchange?.()` καλείται σε κάθε mutation → ο calling code ενημερώνει live τα Drawing header fields (bidirectional sync)
+- `syncEndFromBase()`: End input = `snapViewElevationMeters(item.baseElevation + item.height)`
+
+**End field — editable, linked:**
+- Αλλαγή End → αυτόματη ενημέρωση Start (Height παραμένει σταθερό): `item.baseElevation = snapViewElevationMeters(endVal - item.height)`
+- `snapViewElevationMeters(v)`: `Math.round(v / STEP) * STEP` → `Math.round(val * 100) / 100` — αποτρέπει floating point drift (π.χ. `5.1499999` αντί `5.15`)
+
+**Drag — δύο τύποι:**
+- `type: "drawing"` — σέρνει ολόκληρο group, reorders `draft.drawingGroups`
+- `type: "layer"` — σέρνει layer μέσα σε group, reorders `group.items`
+- `state.viewEditPointerDrag.type` διακρίνει τους δύο τύπους
 
 **Πεδία per-layer** (αποθηκεύονται στο `view.layerConfigs[layerId]`):
 
