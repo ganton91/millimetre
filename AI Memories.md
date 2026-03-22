@@ -238,7 +238,7 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
       drawingId,
       name,
       collapsed,   // bool — default: πρώτο group open, υπόλοιπα collapsed
-      items: [{ layerId, baseElevation, height, color, opacity, outline, outlineColor, outlineWidth, excludeFromSectionCut, name }]
+      items: [{ layerId, baseElevation, height, color, opacity, outlineColor, outlineWidth, excludeFromSectionCut, hidden, name }]
     }
   ]
 }
@@ -281,11 +281,12 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 | `baseElevation` | meters, snapped | `0` | έναρξη layer |
 | `height` | meters, non-negative, snapped | `0` | ύψος layer |
 | `color` | string \| null | `null` → representative color | override χρώμα για αυτό το view |
-| `opacity` | 0–1 | `1` | opacity override |
-| `outline` | bool | `false` | per-layer outline on/off |
+| `opacity` | 0–1 | `1` | opacity override (δεν εκτίθεται στο UI — παραμένει στο model) |
+| `outline` | bool | `false` | derived: `outlineWidth > 0` — δεν αποθηκεύεται στο draft |
 | `outlineColor` | string | global outline color | custom outline color |
-| `outlineWidth` | int 1–12 | `1` | πλάτος outline |
+| `outlineWidth` | int **0–12** | `0` | 0 = outline off, 1–12 = outline on με αυτό το πλάτος |
 | `excludeFromSectionCut` | bool | `false` | βλ. παρακάτω |
+| `hidden` | bool | `false` | αποκλείει το layer από το view render — filter γίνεται στο `orderedConfiguredLayersForView` |
 
 ### `excludeFromSectionCut`
 

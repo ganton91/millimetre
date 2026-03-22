@@ -1749,7 +1749,7 @@
       .view-edit-column-headings,
       .view-edit-layer-row {
         display: grid;
-        grid-template-columns: 16px minmax(0, 1fr) 56px 132px 58px 56px 112px 58px 88px 88px 88px;
+        grid-template-columns: 16px minmax(0, 1fr) 56px 56px 112px 88px 88px 88px 58px;
         gap: 10px;
         align-items: center;
       }
@@ -1858,16 +1858,16 @@
 
       .view-edit-drawing-header {
         display: grid;
-        grid-template-columns: 16px minmax(0, 1fr) 56px 132px 58px 56px 112px 58px 88px 88px 88px;
+        grid-template-columns: 16px minmax(0, 1fr) 56px 56px 112px 88px 88px 88px 58px;
         gap: 10px;
         align-items: center;
-        padding: 8px 10px;
+        padding: 8px 18px 8px 10px;
         border-radius: 11px 11px 0 0;
         user-select: none;
       }
 
       .view-edit-drawing-header-main {
-        grid-column: 2 / 9;
+        grid-column: 2 / 6;
         display: flex;
         align-items: center;
         gap: 8px;
@@ -1913,7 +1913,7 @@
       .view-edit-drawing-layers {
         display: flex;
         flex-direction: column;
-        padding: 6px 0;
+        padding: 6px 8px;
         gap: 8px;
       }
 
@@ -1953,12 +1953,24 @@
       }
 
       .view-edit-layer-name {
+        display: flex;
+        align-items: center;
+        gap: 6px;
         min-width: 0;
+      }
+
+      .view-edit-layer-name span {
         font-size: 12px;
         font-weight: 600;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        min-width: 0;
+      }
+
+      .view-edit-hide-toggle {
+        flex-shrink: 0;
+        cursor: pointer;
       }
 
       .view-edit-field input {
@@ -4632,9 +4644,10 @@
               : state.viewOutlineEffect.color,
           outlineWidth:
             Number.isFinite(existingConfig && existingConfig.outlineWidth)
-              ? Math.max(1, Math.min(12, Math.round(existingConfig.outlineWidth)))
+              ? Math.max(0, Math.min(12, Math.round(existingConfig.outlineWidth)))
               : 1,
           excludeFromSectionCut: !!(existingConfig && existingConfig.excludeFromSectionCut),
+          hidden: !!(existingConfig && existingConfig.hidden),
         };
       }
 
@@ -4735,7 +4748,8 @@
               },
             };
           })
-          .filter(Boolean);
+          .filter(Boolean)
+          .filter(({ config }) => !config.hidden);
       }
 
       function resizeViewPaneCanvas(canvas, context) {
@@ -6689,10 +6703,10 @@
                   height: snapViewElevationMeters(config.height, { allowNegative: false }),
                   color: config.color || (layer ? layerRepresentativeColor(layer) : DEFAULT_COLOR),
                   opacity: config.opacity,
-                  outline: config.outline,
                   outlineColor: config.outlineColor || state.viewOutlineEffect.color,
-                  outlineWidth: config.outlineWidth,
+                  outlineWidth: config.outline ? config.outlineWidth : 0,
                   excludeFromSectionCut: config.excludeFromSectionCut,
+                  hidden: config.hidden,
                   name: layer ? layer.name : "Layer",
                 };
               }),
@@ -6722,10 +6736,11 @@
             height: snapViewElevationMeters(Number.isFinite(item.height) ? item.height : 0, { allowNegative: false }),
             color: typeof item.color === "string" ? item.color : DEFAULT_COLOR,
             opacity: Math.max(0, Math.min(1, Number.isFinite(item.opacity) ? item.opacity : 1)),
-            outline: !!item.outline,
+            outline: item.outlineWidth > 0,
             outlineColor: typeof item.outlineColor === "string" ? item.outlineColor : state.viewOutlineEffect.color,
-            outlineWidth: Math.max(1, Math.min(12, Math.round(Number.isFinite(item.outlineWidth) ? item.outlineWidth : 1))),
+            outlineWidth: Math.max(0, Math.min(12, Math.round(Number.isFinite(item.outlineWidth) ? item.outlineWidth : 0))),
             excludeFromSectionCut: !!item.excludeFromSectionCut,
+            hidden: !!item.hidden,
           };
         });
         view.layerConfigs = nextLayerConfigs;
@@ -9559,10 +9574,21 @@
         });
         row.appendChild(grip);
 
-        const name = document.createElement("div");
-        name.className = "view-edit-layer-name";
-        name.textContent = item.name;
-        row.appendChild(name);
+        const nameCell = document.createElement("div");
+        nameCell.className = "view-edit-layer-name";
+        const nameText = document.createElement("span");
+        nameText.textContent = item.name;
+        const hideToggle = document.createElement("input");
+        hideToggle.type = "checkbox";
+        hideToggle.className = "view-edit-hide-toggle";
+        hideToggle.checked = !item.hidden;
+        hideToggle.setAttribute("aria-label", item.name + " active in view");
+        hideToggle.addEventListener("click", (event) => event.stopPropagation());
+        hideToggle.addEventListener("pointerdown", (event) => event.stopPropagation());
+        hideToggle.addEventListener("input", () => { item.hidden = !hideToggle.checked; });
+        nameCell.appendChild(nameText);
+        nameCell.appendChild(hideToggle);
+        row.appendChild(nameCell);
 
         const colorInput = document.createElement("input");
         colorInput.className = "view-edit-color-input";
@@ -9573,41 +9599,6 @@
         colorInput.addEventListener("pointerdown", (event) => event.stopPropagation());
         colorInput.addEventListener("input", () => { item.color = colorInput.value || DEFAULT_COLOR; });
         row.appendChild(colorInput);
-
-        const opacityField = document.createElement("div");
-        opacityField.className = "view-edit-opacity";
-        const opacityInput = document.createElement("input");
-        opacityInput.type = "range";
-        opacityInput.min = "0";
-        opacityInput.max = "100";
-        opacityInput.step = "1";
-        opacityInput.value = String(Math.round((Number(item.opacity) || 0) * 100));
-        opacityInput.setAttribute("aria-label", item.name + " opacity override");
-        opacityInput.addEventListener("click", (event) => event.stopPropagation());
-        opacityInput.addEventListener("pointerdown", (event) => event.stopPropagation());
-        const opacityValue = document.createElement("div");
-        opacityValue.className = "view-edit-opacity-value";
-        const updateOpacityValue = () => {
-          opacityValue.textContent = String(Math.round((Number(item.opacity) || 0) * 100)) + "%";
-        };
-        opacityInput.addEventListener("input", () => {
-          item.opacity = Math.max(0, Math.min(1, Number(opacityInput.value) / 100));
-          updateOpacityValue();
-        });
-        opacityField.appendChild(opacityInput);
-        updateOpacityValue();
-        opacityField.appendChild(opacityValue);
-        row.appendChild(opacityField);
-
-        const outlineToggle = document.createElement("input");
-        outlineToggle.className = "view-edit-outline-toggle";
-        outlineToggle.type = "checkbox";
-        outlineToggle.checked = !!item.outline;
-        outlineToggle.setAttribute("aria-label", item.name + " keep outline");
-        outlineToggle.addEventListener("click", (event) => event.stopPropagation());
-        outlineToggle.addEventListener("pointerdown", (event) => event.stopPropagation());
-        outlineToggle.addEventListener("input", () => { item.outline = outlineToggle.checked; });
-        row.appendChild(outlineToggle);
 
         const outlineColorInput = document.createElement("input");
         outlineColorInput.className = "view-edit-color-input";
@@ -9622,39 +9613,27 @@
         row.appendChild(outlineColorInput);
 
         const outlineWidthField = document.createElement("div");
-        outlineWidthField.className = "view-edit-opacity";
+        outlineWidthField.className = "field view-edit-field";
         const outlineWidthInput = document.createElement("input");
-        outlineWidthInput.type = "range";
-        outlineWidthInput.min = "1";
+        outlineWidthInput.type = "number";
+        outlineWidthInput.min = "0";
         outlineWidthInput.max = "12";
         outlineWidthInput.step = "1";
-        outlineWidthInput.value = String(Math.max(1, Math.min(12, Math.round(Number(item.outlineWidth) || 1))));
+        outlineWidthInput.value = String(Math.max(0, Math.min(12, Math.round(Number(item.outlineWidth) || 0))));
         outlineWidthInput.setAttribute("aria-label", item.name + " outline width");
         outlineWidthInput.addEventListener("click", (event) => event.stopPropagation());
         outlineWidthInput.addEventListener("pointerdown", (event) => event.stopPropagation());
-        const outlineWidthValue = document.createElement("div");
-        outlineWidthValue.className = "view-edit-outline-width-value";
-        const updateOutlineWidthValue = () => {
-          outlineWidthValue.textContent = String(Math.max(1, Math.min(12, Math.round(Number(item.outlineWidth) || 1))));
-        };
         outlineWidthInput.addEventListener("input", () => {
-          item.outlineWidth = Math.max(1, Math.min(12, Math.round(Number(outlineWidthInput.value) || 1)));
-          updateOutlineWidthValue();
+          item.outlineWidth = Math.max(0, Math.min(12, Math.round(Number(outlineWidthInput.value) || 0)));
         });
+        const normalizeOutlineWidthValue = () => {
+          item.outlineWidth = Math.max(0, Math.min(12, Math.round(Number(outlineWidthInput.value) || 0)));
+          outlineWidthInput.value = String(item.outlineWidth);
+        };
+        outlineWidthInput.addEventListener("change", normalizeOutlineWidthValue);
+        outlineWidthInput.addEventListener("blur", normalizeOutlineWidthValue);
         outlineWidthField.appendChild(outlineWidthInput);
-        updateOutlineWidthValue();
-        outlineWidthField.appendChild(outlineWidthValue);
         row.appendChild(outlineWidthField);
-
-        const sectionCutToggle = document.createElement("input");
-        sectionCutToggle.className = "view-edit-outline-toggle";
-        sectionCutToggle.type = "checkbox";
-        sectionCutToggle.checked = !item.excludeFromSectionCut;
-        sectionCutToggle.setAttribute("aria-label", item.name + " include in section cut");
-        sectionCutToggle.addEventListener("click", (event) => event.stopPropagation());
-        sectionCutToggle.addEventListener("pointerdown", (event) => event.stopPropagation());
-        sectionCutToggle.addEventListener("input", () => { item.excludeFromSectionCut = !sectionCutToggle.checked; });
-        row.appendChild(sectionCutToggle);
 
         const heightField = document.createElement("div");
         heightField.className = "field view-edit-field";
@@ -9740,6 +9719,16 @@
         syncEndFromBase();
         endingField.appendChild(endInput);
         row.appendChild(endingField);
+
+        const sectionCutToggle = document.createElement("input");
+        sectionCutToggle.className = "view-edit-outline-toggle";
+        sectionCutToggle.type = "checkbox";
+        sectionCutToggle.checked = !item.excludeFromSectionCut;
+        sectionCutToggle.setAttribute("aria-label", item.name + " include in section cut");
+        sectionCutToggle.addEventListener("click", (event) => event.stopPropagation());
+        sectionCutToggle.addEventListener("pointerdown", (event) => event.stopPropagation());
+        sectionCutToggle.addEventListener("input", () => { item.excludeFromSectionCut = !sectionCutToggle.checked; });
+        row.appendChild(sectionCutToggle);
 
         return { row, baseInput, syncEndFromBase };
       }
@@ -9901,7 +9890,7 @@
           // Column headings inside the card
           const headings = document.createElement("div");
           headings.className = "view-edit-column-headings view-edit-column-headings-inner";
-          ["", "Layer", "Color", "Opacity", "Outline", "Line", "Width", "Cut", "Height", "Start", "End"].forEach((label) => {
+          ["", "Layer", "Color", "Line", "Width", "Height", "Start", "End", "Cut"].forEach((label) => {
             const span = document.createElement("span");
             span.textContent = label;
             headings.appendChild(span);
