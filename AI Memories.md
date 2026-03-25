@@ -154,11 +154,37 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 
 **Σημαντικός περιορισμός αυτού του σταδίου:** το legacy tile paint path παραμένει ακόμα ενεργό κάτω από το vector render. Άρα το σύστημα βρίσκεται σε hybrid φάση, όχι σε πλήρες vector-only cutover.
 
+**Erase precision rule:** στο vector main-canvas render, τα erase objects δεν πρέπει να βασίζονται σε plain `destination-out`, γιατί το multiplicative alpha αφήνει fringes στα anti-aliased όρια. Το erase pass γίνεται με προσωρινό vector mask surface και exact alpha subtract πάνω στο layer composite, ώστε ίδιο paint / ίδιο erase να ακυρώνονται χωρίς επιστροφή σε per-cell rendering.
+
+**Erase performance rule:** το subtractive erase δεν πρέπει να κάνει `getImageData` / `putImageData` σε όλο το layer canvas για κάθε erase object, γιατί το κόστος κλιμακώνεται με το πλήθος των erase operations και προκαλεί lag. Το pixel subtract πρέπει να περιορίζεται στο ελάχιστο screen-space bounding rect του συγκεκριμένου vector object.
+
+**Vector op compositing rule:** το main canvas vector pass έχει αρχίσει να ενοποιείται σε shared per-object op surface για `paint` και `erase`. Και τα δύο modes rasterize-άρουν πρώτα το ίδιο vector coverage σε temporary surface· μετά το `paint` κάνει bounded blit στο layer composite ενώ το `erase` κάνει bounded alpha subtract. Το legacy tile render παραμένει από κάτω για compatibility.
+
+**Layer composite cache rule:** το main content render μπορεί να κρατά per-layer screen-space composite cache για το τρέχον viewport signature (`width/height/x/y/zoom`) και να εφαρμόζει incremental vector replay μόνο για newly appended vector objects. Αν αλλάξει viewport, αν αλλάξουν legacy tiles, ή αν γίνει history rewind/restore, το layer composite πρέπει να ξαναχτίζεται πλήρως.
+
+**Chunked vector cache direction:** για να μη βαραίνει το pan/zoom μετά από πολλά vector erase ops, το main content render μπορεί να μετατοπίζεται από ενιαίο viewport cache σε chunked per-layer cache πάνω στο world tile grid (`TILE_SIZE` chunks). Σε αυτή την κατεύθυνση:
+- γίνονται reuse μόνο τα ορατά chunks στο ίδιο zoom
+- νέα vector ops εφαρμόζονται incrementally μόνο στα chunks που τέμνουν το object bounds
+- zoom navigation δεν πρέπει να πετάει μαζικά τα cached chunks σε κάθε wheel step, γιατί αυτό επαναφέρει το lag. Τα chunks μπορούν να reused/scaled προσωρινά στο zoom/pan και να ξαναχτίζονται lazily σε επόμενο edit ή σε πραγματικό invalidation (tile/history changes).
+
+**Post-zoom warmup rule:** αν το zoom navigation reuse-άρει προσωρινά chunks από προηγούμενο zoom level για ομαλό wheel interaction, πρέπει να υπάρχει lazy background warm-up των visible chunks αφού η κίνηση σταθεροποιηθεί. Στόχος: να μη φορτώνεται το πρώτο `paint/erase` μετά το zoom με το κόστος του πρώτου rebuild.
+
+
 ### Authoring cutover — νέα actions σε vector-only path
 
 - Τα νέα `Brush` και `Shape` authoring actions γράφουν πλέον **μόνο** σε `layer.vectorObjects`
 - Το παλιό tile paint path παραμένει στο codebase μόνο για legacy content / staged compatibility
 - Αυτό έγινε για να σταματήσει το διπλό visual αποτέλεσμα του mirror stage (tiles + vectors για την ίδια νέα πράξη)
+
+### Grid-snapped, vector-rendered
+
+- Το `5cm` grid ορίζει snap / μέτρηση / discrete dimensions του authoring model
+- Τα vector objects παραμένουν continuous shapes στο render path
+- Δεν γίνεται per-cell resolve για το main canvas display truth
+- Άρα:
+  - storage truth = vector objects
+  - display truth = continuous vector render
+  - grid truth = snapping / sizing / measurements / future calculations
 
 ### Basic vector hit model
 
