@@ -140,6 +140,20 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 - Και εδώ τα brush vector objects φέρουν `compositeMode: "paint" | "erase"`
 - Το erase αποθηκεύεται ως ξεχωριστή brushStroke operation, όχι ως άμεσο destructive rewrite των προηγούμενων vector strokes.
 
+### Main canvas — πρώτο vector render cutover
+
+- Το `drawContentScene()` δεν ζωγραφίζει πια κάθε layer κατευθείαν στο `contentCtx`
+- Κάθε layer περνά πρώτα από scratch composite surface:
+  - legacy tile render
+  - vector object render (`shape` + `brushStroke`)
+  - `compositeMode: "paint" | "erase"` με canvas compositing
+  - τελικό blit στο main `contentCtx` με το layer opacity
+- Αυτό έγινε για 2 λόγους:
+  - να αρχίσουν να φαίνονται τα νέα vector authoring operations στο main canvas
+  - να μη σπάσει το layer opacity όταν συνυπάρχουν paint + erase vector operations
+
+**Σημαντικός περιορισμός αυτού του σταδίου:** το legacy tile paint path παραμένει ακόμα ενεργό κάτω από το vector render. Άρα το σύστημα βρίσκεται σε hybrid φάση, όχι σε πλήρες vector-only cutover.
+
 ---
 
 ## Collaboration Rules

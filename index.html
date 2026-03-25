@@ -2957,6 +2957,8 @@
       const rulerLeftCtx = ui.rulerLeft.getContext("2d");
       const rulerBottomCtx = ui.rulerBottom.getContext("2d");
       const rulerRightCtx = ui.rulerRight.getContext("2d");
+      const layerCompositeCanvas = document.createElement("canvas");
+      const layerCompositeCtx = layerCompositeCanvas.getContext("2d");
 
       const state = {
         theme: "light",
@@ -11226,6 +11228,123 @@
         });
       }
 
+      function ensureLayerCompositeSurface(width, height) {
+        if (layerCompositeCanvas.width !== width) layerCompositeCanvas.width = width;
+        if (layerCompositeCanvas.height !== height) layerCompositeCanvas.height = height;
+        layerCompositeCtx.imageSmoothingEnabled = false;
+        layerCompositeCtx.clearRect(0, 0, width, height);
+        return layerCompositeCtx;
+      }
+
+      function drawLayerTilesToContext(context, layer, bounds, tileSpan) {
+        for (let tileY = bounds.minTileY; tileY <= bounds.maxTileY; tileY += 1) {
+          for (let tileX = bounds.minTileX; tileX <= bounds.maxTileX; tileX += 1) {
+            const tile = layer.tiles[tileKey(tileX, tileY)];
+            if (!tile) continue;
+            redrawTile(tile);
+            const screenX = snapPixel(state.viewport.x + tileX * tileSpan);
+            const screenY = snapPixel(state.viewport.y + tileY * tileSpan);
+            const nextScreenX = snapPixel(state.viewport.x + (tileX + 1) * tileSpan);
+            const nextScreenY = snapPixel(state.viewport.y + (tileY + 1) * tileSpan);
+            const drawWidth = Math.max(1, nextScreenX - screenX);
+            const drawHeight = Math.max(1, nextScreenY - screenY);
+            context.drawImage(tile.canvas, screenX, screenY, drawWidth, drawHeight);
+          }
+        }
+      }
+
+      function vectorObjectCompositeOperation(vectorObject) {
+        return vectorObject?.compositeMode === "erase" ? "destination-out" : "source-over";
+      }
+
+      function applyVectorObjectStyle(context, vectorObject) {
+        const style = vectorObject?.style || {};
+        const shouldFill = !style.noFill && typeof style.fillColor === "string";
+        const shouldStroke = typeof style.outlineColor === "string" && Number(style.outlineWidthCells) > 0;
+        context.fillStyle = shouldFill ? style.fillColor : "rgba(0,0,0,1)";
+        context.strokeStyle = shouldStroke ? style.outlineColor : context.fillStyle;
+        context.lineWidth = Math.max(1, Number(style.outlineWidthCells || 0) * CELL_SIZE * state.viewport.zoom);
+        return { shouldFill, shouldStroke };
+      }
+
+      function drawVectorGeometryPath(context, geometry) {
+        if (!geometry || typeof geometry !== "object") return false;
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          const bounds = geometry.bounds;
+          if (!bounds) return false;
+          const topLeft = worldToScreen(bounds.minX, bounds.minY);
+          const width = Math.max(0, (bounds.maxX - bounds.minX) * state.viewport.zoom);
+          const height = Math.max(0, (bounds.maxY - bounds.minY) * state.viewport.zoom);
+          if (geometry.type === "rect") {
+            context.beginPath();
+            context.rect(topLeft.x, topLeft.y, width, height);
+            return true;
+          }
+          context.beginPath();
+          context.ellipse(topLeft.x + width / 2, topLeft.y + height / 2, Math.max(0.5, width / 2), Math.max(0.5, height / 2), 0, 0, Math.PI * 2);
+          return true;
+        }
+        if (geometry.type === "circle") {
+          const center = worldToScreen(geometry.center.x, geometry.center.y);
+          context.beginPath();
+          context.ellipse(
+            center.x,
+            center.y,
+            Math.max(0.5, geometry.radius * state.viewport.zoom),
+            Math.max(0.5, geometry.radius * state.viewport.zoom),
+            0,
+            0,
+            Math.PI * 2
+          );
+          return true;
+        }
+        if (geometry.type === "polygon" && Array.isArray(geometry.points) && geometry.points.length >= 2) {
+          context.beginPath();
+          geometry.points.forEach((point, index) => {
+            const screen = worldToScreen(point.x, point.y);
+            if (index === 0) context.moveTo(screen.x, screen.y);
+            else context.lineTo(screen.x, screen.y);
+          });
+          context.closePath();
+          return true;
+        }
+        return false;
+      }
+
+      function renderVectorObjectToContext(context, vectorObject) {
+        if (!vectorObject || typeof vectorObject !== "object") return;
+        context.save();
+        context.globalCompositeOperation = vectorObjectCompositeOperation(vectorObject);
+        const { shouldFill, shouldStroke } = applyVectorObjectStyle(context, vectorObject);
+
+        if (vectorObject.kind === "brushStroke" && Array.isArray(vectorObject.stamps)) {
+          vectorObject.stamps.forEach((stamp) => {
+            if (!stamp?.bounds) return;
+            const geometry = {
+              type: vectorObject.brushShape === "circle" ? "ellipse" : "rect",
+              bounds: stamp.bounds,
+            };
+            if (!drawVectorGeometryPath(context, geometry)) return;
+            if (shouldFill || vectorObject.compositeMode === "erase") context.fill();
+            if (shouldStroke) context.stroke();
+          });
+          context.restore();
+          return;
+        }
+
+        if (drawVectorGeometryPath(context, vectorObject.geometry)) {
+          if (shouldFill || vectorObject.compositeMode === "erase") context.fill();
+          if (shouldStroke) context.stroke();
+        }
+        context.restore();
+      }
+
+      function drawLayerVectorObjectsToContext(context, layer) {
+        (layer.vectorObjects || []).forEach((vectorObject) => {
+          renderVectorObjectToContext(context, vectorObject);
+        });
+      }
+
       function drawContentScene() {
         const width = ui.contentCanvas.clientWidth;
         const height = ui.contentCanvas.clientHeight;
@@ -11237,22 +11356,12 @@
         [...getAllLayers()].reverse().forEach((layer) => {
           if (!layer.visible) return;
           if (findDrawingForLayer(layer.id)?.visible === false) return;
+          const layerCtx = ensureLayerCompositeSurface(width, height);
+          drawLayerTilesToContext(layerCtx, layer, bounds, tileSpan);
+          drawLayerVectorObjectsToContext(layerCtx, layer);
           contentCtx.save();
           contentCtx.globalAlpha = layer.opacity;
-          for (let tileY = bounds.minTileY; tileY <= bounds.maxTileY; tileY += 1) {
-            for (let tileX = bounds.minTileX; tileX <= bounds.maxTileX; tileX += 1) {
-              const tile = layer.tiles[tileKey(tileX, tileY)];
-              if (!tile) continue;
-              redrawTile(tile);
-              const screenX = snapPixel(state.viewport.x + tileX * tileSpan);
-              const screenY = snapPixel(state.viewport.y + tileY * tileSpan);
-              const nextScreenX = snapPixel(state.viewport.x + (tileX + 1) * tileSpan);
-              const nextScreenY = snapPixel(state.viewport.y + (tileY + 1) * tileSpan);
-              const drawWidth = Math.max(1, nextScreenX - screenX);
-              const drawHeight = Math.max(1, nextScreenY - screenY);
-              contentCtx.drawImage(tile.canvas, screenX, screenY, drawWidth, drawHeight);
-            }
-          }
+          contentCtx.drawImage(layerCompositeCanvas, 0, 0);
           contentCtx.restore();
         });
       }
