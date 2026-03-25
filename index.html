@@ -13090,11 +13090,12 @@
       }
 
       function createBrushStrokeVectorObject(interaction) {
-        if (!interaction || interaction.mode !== "paint" || !interaction.vectorStampCells?.length) return null;
+        if (!interaction || !interaction.vectorStampCells?.length) return null;
         return {
           id: generateVectorObjectId(),
           kind: "brushStroke",
           sourceTool: "brush",
+          compositeMode: interaction.mode === "erase" ? "erase" : "paint",
           brushShape: interaction.brushShape,
           brushWidth: interaction.brushWidth * CELL_SIZE,
           brushHeight: interaction.brushHeight * CELL_SIZE,
@@ -13231,13 +13232,14 @@
       }
 
       function createShapeVectorObject(interaction) {
-        if (!interaction || interaction.mode !== "paint") return null;
+        if (!interaction) return null;
         const base = {
           id: generateVectorObjectId(),
           kind: "shape",
           sourceTool: "shape",
+          compositeMode: interaction.mode === "erase" ? "erase" : "paint",
           shapeType: interaction.shapeType,
-          style: currentVectorStyleSnapshot(),
+          style: clonePlainData(interaction.vectorStyle || currentVectorStyleSnapshot()),
         };
         if (interaction.shapeType === "circle") {
           const spec = circleSpecFromInteraction(interaction);
@@ -13260,14 +13262,15 @@
         };
       }
 
-      function createPolygonVectorObject(points, mode) {
-        if (!Array.isArray(points) || points.length < 3 || mode !== "paint") return null;
+      function createPolygonVectorObject(points, mode, vectorStyle = null) {
+        if (!Array.isArray(points) || points.length < 3) return null;
         return {
           id: generateVectorObjectId(),
           kind: "shape",
           sourceTool: "shape",
+          compositeMode: mode === "erase" ? "erase" : "paint",
           shapeType: "polygon",
-          style: currentVectorStyleSnapshot(),
+          style: clonePlainData(vectorStyle || currentVectorStyleSnapshot()),
           geometry: {
             type: "polygon",
             points: points.map(cellPointToWorldPoint),
@@ -13594,6 +13597,7 @@
           currentCellY: cell.y,
           startClientX: clientX,
           startClientY: clientY,
+          vectorStyle: currentVectorStyleSnapshot(),
           moved: false,
         };
         setStatus(mode === "paint" ? "Drag to paint a shape." : "Drag to erase a shape.");
@@ -13611,6 +13615,7 @@
           startCellY: draft.startCellY,
           currentCellX: Number.isInteger(currentCellX) ? currentCellX : draft.currentCellX,
           currentCellY: Number.isInteger(currentCellY) ? currentCellY : draft.currentCellY,
+          vectorStyle: clonePlainData(draft.vectorStyle || currentVectorStyleSnapshot()),
         };
       }
 
@@ -13625,6 +13630,7 @@
           startCellY: interaction.startCellY,
           currentCellX: interaction.startCellX,
           currentCellY: interaction.startCellY,
+          vectorStyle: clonePlainData(interaction.vectorStyle || currentVectorStyleSnapshot()),
         };
       }
 
@@ -13647,7 +13653,7 @@
         const layer = activeLayer();
         const changed = paintPolygonShape(points, mode);
         if (changed && layer) {
-          appendVectorObject(layer, createPolygonVectorObject(points, mode));
+          appendVectorObject(layer, createPolygonVectorObject(points, mode, state.shapeDraft?.vectorStyle || null));
         }
         state.shapeDraft = null;
         state.polygonClickMemory = null;
@@ -13691,6 +13697,7 @@
             type: "polygon",
             mode,
             points: [point],
+            vectorStyle: currentVectorStyleSnapshot(),
             hover: point,
             hoverWorld: {
               x: (point.x + 0.5) * CELL_SIZE,

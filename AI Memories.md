@@ -123,7 +123,8 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 - Το υπάρχον cell paint path παραμένει ενεργό παράλληλα, άρα:
   - το σημερινό renderer και τα downstream subsystems συνεχίζουν να δουλεύουν
   - το vector storage λειτουργεί προς το παρόν ως authoring mirror για το επόμενο στάδιο
-- Στο παρόν βήμα μόνο τα **paint** shapes γίνονται mirror σε vector objects. Το erase behavior δεν έχει μεταφερθεί ακόμα στο vector model.
+- Τα shape vector objects φέρουν πλέον και `compositeMode: "paint" | "erase"`
+- Το erase δεν κάνει ακόμα destructive boolean edits πάνω σε υπάρχοντα vector objects. Καταγράφεται ως ξεχωριστή vector authoring operation για μελλοντικό vector render/resolve stage.
 
 ### Brush mirror πάνω στο νέο model
 
@@ -136,7 +137,8 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - `style` snapshot από τη στιγμή που ξεκινά το stroke
   - `stamps[]` με world-space bounds για κάθε sampled brush footprint του stroke
 - Το υπάρχον cell brush painting παραμένει ενεργό παράλληλα
-- Και εδώ, στο παρόν στάδιο, μόνο τα **paint** strokes γίνονται mirror σε vector objects. Το erase δεν έχει περάσει ακόμα στο vector model.
+- Και εδώ τα brush vector objects φέρουν `compositeMode: "paint" | "erase"`
+- Το erase αποθηκεύεται ως ξεχωριστή brushStroke operation, όχι ως άμεσο destructive rewrite των προηγούμενων vector strokes.
 
 ---
 
