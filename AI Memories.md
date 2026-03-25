@@ -154,6 +154,25 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 
 **Σημαντικός περιορισμός αυτού του σταδίου:** το legacy tile paint path παραμένει ακόμα ενεργό κάτω από το vector render. Άρα το σύστημα βρίσκεται σε hybrid φάση, όχι σε πλήρες vector-only cutover.
 
+### Authoring cutover — νέα actions σε vector-only path
+
+- Τα νέα `Brush` και `Shape` authoring actions γράφουν πλέον **μόνο** σε `layer.vectorObjects`
+- Το παλιό tile paint path παραμένει στο codebase μόνο για legacy content / staged compatibility
+- Αυτό έγινε για να σταματήσει το διπλό visual αποτέλεσμα του mirror stage (tiles + vectors για την ίδια νέα πράξη)
+
+### Basic vector hit model
+
+- `samplePaintColorAt` και `topPaintedLayerAt` διαβάζουν πλέον και από vector objects
+- Υπάρχει βασικό point-hit evaluation για:
+  - rect
+  - ellipse
+  - circle
+  - polygon
+  - brush stamps
+- Το `layerMatchesRect` κάνει πλέον και basic vector-aware matching για marquee selection
+
+**Περιορισμός αυτού του σταδίου:** το vector hit model είναι intentionally basic και δεν λύνει ακόμα όλα τα σύνθετα cases (π.χ. πλήρες boolean resolve πάνω από legacy tile content ή ακριβές transform handles για vector-only layers).
+
 ---
 
 ## Collaboration Rules

@@ -11609,6 +11609,7 @@
       }
 
       function layerMatchesRect(layer, rect, containment) {
+        if (layerHasVectorMatch(layer, rect, containment)) return true;
         let hasCells = false;
         let intersects = false;
         let fullyContained = true;
@@ -13334,6 +13335,10 @@
         };
       }
 
+      function useVectorAuthoring() {
+        return true;
+      }
+
       function appendVectorObject(layer, vectorObject) {
         if (!layer || !vectorObject) return false;
         layer.vectorObjects.push(vectorObject);
@@ -13612,18 +13617,223 @@
         ctx.restore();
       }
 
+      function worldRectFromBounds(bounds) {
+        if (!bounds) return null;
+        return {
+          left: bounds.minX,
+          top: bounds.minY,
+          right: bounds.maxX,
+          bottom: bounds.maxY,
+        };
+      }
+
+      function rectContainsWorldPoint(bounds, worldX, worldY) {
+        return !!bounds && worldX >= bounds.minX && worldX <= bounds.maxX && worldY >= bounds.minY && worldY <= bounds.maxY;
+      }
+
+      function ellipseContainsWorldPoint(bounds, worldX, worldY) {
+        if (!bounds) return false;
+        const centerX = (bounds.minX + bounds.maxX) / 2;
+        const centerY = (bounds.minY + bounds.maxY) / 2;
+        const radiusX = Math.max(1e-6, (bounds.maxX - bounds.minX) / 2);
+        const radiusY = Math.max(1e-6, (bounds.maxY - bounds.minY) / 2);
+        const nx = (worldX - centerX) / radiusX;
+        const ny = (worldY - centerY) / radiusY;
+        return nx * nx + ny * ny <= 1;
+      }
+
+      function circleContainsWorldPoint(geometry, worldX, worldY) {
+        if (!geometry?.center || !Number.isFinite(geometry.radius)) return false;
+        return Math.hypot(worldX - geometry.center.x, worldY - geometry.center.y) <= geometry.radius;
+      }
+
+      function polygonEdges(points) {
+        if (!Array.isArray(points) || points.length < 2) return [];
+        return points.map((point, index) => [point, points[(index + 1) % points.length]]);
+      }
+
+      function polygonStrokeContainsWorldPoint(points, worldX, worldY, strokeWidth) {
+        return polygonEdges(points).some(([start, end]) => distanceToSegment(worldX, worldY, start, end) <= strokeWidth);
+      }
+
+      function vectorOutlineWidthWorld(style) {
+        return Math.max(0, Number(style?.outlineWidthCells || 0) * CELL_SIZE);
+      }
+
+      function vectorGeometryFillContainsPoint(geometry, worldX, worldY) {
+        if (!geometry || typeof geometry !== "object") return false;
+        if (geometry.type === "rect") return rectContainsWorldPoint(geometry.bounds, worldX, worldY);
+        if (geometry.type === "ellipse") return ellipseContainsWorldPoint(geometry.bounds, worldX, worldY);
+        if (geometry.type === "circle") return circleContainsWorldPoint(geometry, worldX, worldY);
+        if (geometry.type === "polygon") return Array.isArray(geometry.points) && pointInPolygon(worldX, worldY, geometry.points);
+        return false;
+      }
+
+      function vectorGeometryStrokeContainsPoint(geometry, worldX, worldY, strokeWidth, strokeSide) {
+        if (!geometry || strokeWidth <= 0) return false;
+        if (geometry.type === "rect") {
+          const bounds = geometry.bounds;
+          if (!bounds) return false;
+          const outer = {
+            minX: bounds.minX - (strokeSide === "outside" ? strokeWidth : 0),
+            minY: bounds.minY - (strokeSide === "outside" ? strokeWidth : 0),
+            maxX: bounds.maxX + (strokeSide === "outside" ? strokeWidth : 0),
+            maxY: bounds.maxY + (strokeSide === "outside" ? strokeWidth : 0),
+          };
+          const inner = {
+            minX: bounds.minX + (strokeSide === "inside" ? strokeWidth : 0),
+            minY: bounds.minY + (strokeSide === "inside" ? strokeWidth : 0),
+            maxX: bounds.maxX - (strokeSide === "inside" ? strokeWidth : 0),
+            maxY: bounds.maxY - (strokeSide === "inside" ? strokeWidth : 0),
+          };
+          return (
+            rectContainsWorldPoint(outer, worldX, worldY) &&
+            !rectContainsWorldPoint(inner, worldX, worldY)
+          );
+        }
+        if (geometry.type === "ellipse") {
+          const bounds = geometry.bounds;
+          if (!bounds) return false;
+          const outer = {
+            minX: bounds.minX - (strokeSide === "outside" ? strokeWidth : 0),
+            minY: bounds.minY - (strokeSide === "outside" ? strokeWidth : 0),
+            maxX: bounds.maxX + (strokeSide === "outside" ? strokeWidth : 0),
+            maxY: bounds.maxY + (strokeSide === "outside" ? strokeWidth : 0),
+          };
+          const inner = {
+            minX: bounds.minX + (strokeSide === "inside" ? strokeWidth : 0),
+            minY: bounds.minY + (strokeSide === "inside" ? strokeWidth : 0),
+            maxX: bounds.maxX - (strokeSide === "inside" ? strokeWidth : 0),
+            maxY: bounds.maxY - (strokeSide === "inside" ? strokeWidth : 0),
+          };
+          return ellipseContainsWorldPoint(outer, worldX, worldY) && !ellipseContainsWorldPoint(inner, worldX, worldY);
+        }
+        if (geometry.type === "circle") {
+          const outerRadius = geometry.radius + (strokeSide === "outside" ? strokeWidth : 0);
+          const innerRadius = Math.max(0, geometry.radius - (strokeSide === "inside" ? strokeWidth : 0));
+          const distance = Math.hypot(worldX - geometry.center.x, worldY - geometry.center.y);
+          return distance <= outerRadius && distance >= innerRadius;
+        }
+        if (geometry.type === "polygon" && Array.isArray(geometry.points) && geometry.points.length >= 2) {
+          const onStroke = polygonStrokeContainsWorldPoint(geometry.points, worldX, worldY, strokeWidth);
+          if (strokeSide === "inside") return onStroke && pointInPolygon(worldX, worldY, geometry.points);
+          if (strokeSide === "outside") return onStroke && !pointInPolygon(worldX, worldY, geometry.points);
+          return onStroke;
+        }
+        return false;
+      }
+
+      function vectorObjectPaintStateAtPoint(vectorObject, worldX, worldY) {
+        if (!vectorObject || typeof vectorObject !== "object") return { visible: false, color: null };
+        if (vectorObject.kind === "brushStroke" && Array.isArray(vectorObject.stamps)) {
+          const style = vectorObject.style || {};
+          const strokeWidth = vectorOutlineWidthWorld(style);
+          for (let index = vectorObject.stamps.length - 1; index >= 0; index -= 1) {
+            const stamp = vectorObject.stamps[index];
+            if (!stamp?.bounds) continue;
+            const geometry = {
+              type: vectorObject.brushShape === "circle" ? "ellipse" : "rect",
+              bounds: stamp.bounds,
+            };
+            const strokeHit = vectorGeometryStrokeContainsPoint(geometry, worldX, worldY, strokeWidth, style.outlineSide);
+            const fillHit = !style.noFill && vectorGeometryFillContainsPoint(geometry, worldX, worldY);
+            if (!strokeHit && !fillHit) continue;
+            return {
+              visible: vectorObject.compositeMode !== "erase",
+              color: strokeHit ? style.outlineColor || null : style.fillColor || null,
+            };
+          }
+          return { visible: false, color: null };
+        }
+        const style = vectorObject.style || {};
+        const strokeWidth = vectorOutlineWidthWorld(style);
+        const strokeHit = vectorGeometryStrokeContainsPoint(vectorObject.geometry, worldX, worldY, strokeWidth, style.outlineSide);
+        const fillHit = !style.noFill && vectorGeometryFillContainsPoint(vectorObject.geometry, worldX, worldY);
+        if (!strokeHit && !fillHit) return { visible: false, color: null };
+        return {
+          visible: vectorObject.compositeMode !== "erase",
+          color: strokeHit ? style.outlineColor || null : style.fillColor || null,
+        };
+      }
+
+      function sampleVectorColorAt(layer, worldX, worldY) {
+        if (!layer) return null;
+        let visible = false;
+        let color = null;
+        (layer.vectorObjects || []).forEach((vectorObject) => {
+          const stateAtPoint = vectorObjectPaintStateAtPoint(vectorObject, worldX, worldY);
+          if (!stateAtPoint.visible && stateAtPoint.color === null) return;
+          visible = stateAtPoint.visible;
+          color = stateAtPoint.visible ? stateAtPoint.color : null;
+        });
+        return visible ? color : null;
+      }
+
+      function vectorObjectBoundsRect(vectorObject) {
+        if (!vectorObject || typeof vectorObject !== "object") return null;
+        if (vectorObject.kind === "brushStroke" && Array.isArray(vectorObject.stamps) && vectorObject.stamps.length) {
+          return vectorObject.stamps.reduce((accumulator, stamp) => {
+            const rect = worldRectFromBounds(stamp.bounds);
+            if (!rect) return accumulator;
+            if (!accumulator) return rect;
+            return {
+              left: Math.min(accumulator.left, rect.left),
+              top: Math.min(accumulator.top, rect.top),
+              right: Math.max(accumulator.right, rect.right),
+              bottom: Math.max(accumulator.bottom, rect.bottom),
+            };
+          }, null);
+        }
+        if (vectorObject.geometry?.type === "circle") {
+          return {
+            left: vectorObject.geometry.center.x - vectorObject.geometry.radius,
+            top: vectorObject.geometry.center.y - vectorObject.geometry.radius,
+            right: vectorObject.geometry.center.x + vectorObject.geometry.radius,
+            bottom: vectorObject.geometry.center.y + vectorObject.geometry.radius,
+          };
+        }
+        if (vectorObject.geometry?.type === "polygon" && Array.isArray(vectorObject.geometry.points) && vectorObject.geometry.points.length) {
+          return vectorObject.geometry.points.reduce((accumulator, point) => ({
+            left: Math.min(accumulator.left, point.x),
+            top: Math.min(accumulator.top, point.y),
+            right: Math.max(accumulator.right, point.x),
+            bottom: Math.max(accumulator.bottom, point.y),
+          }), {
+            left: vectorObject.geometry.points[0].x,
+            top: vectorObject.geometry.points[0].y,
+            right: vectorObject.geometry.points[0].x,
+            bottom: vectorObject.geometry.points[0].y,
+          });
+        }
+        return worldRectFromBounds(vectorObject.geometry?.bounds || null);
+      }
+
+      function layerHasVectorMatch(layer, rect, containment) {
+        const vectorRects = (layer.vectorObjects || [])
+          .filter((vectorObject) => vectorObject?.compositeMode !== "erase")
+          .map(vectorObjectBoundsRect)
+          .filter(Boolean);
+        if (!vectorRects.length) return false;
+        return containment
+          ? vectorRects.some((entry) => rectContainsRect(rect, entry))
+          : vectorRects.some((entry) => rectsIntersect(entry, rect));
+      }
+
       function samplePaintColorAt(worldX, worldY) {
         const layer = topPaintedLayerAt(worldX, worldY);
         if (!layer) return null;
+        const vectorColor = sampleVectorColorAt(layer, worldX, worldY);
+        if (vectorColor) return vectorColor;
         const cell = cellFromWorld(worldX, worldY);
         return getCellColor(layer, cell.x, cell.y);
       }
 
       function topPaintedLayerAt(worldX, worldY) {
-        const cell = cellFromWorld(worldX, worldY);
         for (const layer of getAllLayers()) {
           if (!layer.visible) continue;
           if (findDrawingForLayer(layer.id)?.visible === false) continue;
+          if (sampleVectorColorAt(layer, worldX, worldY)) return layer;
+          const cell = cellFromWorld(worldX, worldY);
           if (getCellColor(layer, cell.x, cell.y)) return layer;
         }
         return null;
@@ -13665,7 +13875,9 @@
         };
         const shouldDrawLine =
           shiftKey && Number.isInteger(state.brush.lastCellX) && Number.isInteger(state.brush.lastCellY);
-        const changed = shouldDrawLine
+        const changed = useVectorAuthoring()
+          ? true
+          : shouldDrawLine
           ? paintBrushLine(state.brush.lastCellX, state.brush.lastCellY, cell.x, cell.y, mode)
           : paintCells(cell.x, cell.y, mode);
         if (shouldDrawLine) {
@@ -13746,12 +13958,13 @@
       function commitShapeInteraction(interaction) {
         const layer = activeLayer();
         if (!layer) return false;
-        const changed =
-          interaction.shapeType === "circle"
-            ? paintCircularShape(interaction, interaction.mode)
-            : interaction.shapeType === "ellipse"
-            ? paintCircleShape(shapeBoundsFromInteraction(interaction), interaction.mode)
-            : paintRectShape(shapeBoundsFromInteraction(interaction), interaction.mode);
+        const changed = useVectorAuthoring()
+          ? true
+          : interaction.shapeType === "circle"
+          ? paintCircularShape(interaction, interaction.mode)
+          : interaction.shapeType === "ellipse"
+          ? paintCircleShape(shapeBoundsFromInteraction(interaction), interaction.mode)
+          : paintRectShape(shapeBoundsFromInteraction(interaction), interaction.mode);
         if (changed) {
           appendVectorObject(layer, createShapeVectorObject(interaction));
         }
@@ -13760,7 +13973,7 @@
 
       function commitPolygonDraft(points, mode) {
         const layer = activeLayer();
-        const changed = paintPolygonShape(points, mode);
+        const changed = useVectorAuthoring() ? true : paintPolygonShape(points, mode);
         if (changed && layer) {
           appendVectorObject(layer, createPolygonVectorObject(points, mode, state.shapeDraft?.vectorStyle || null));
         }
@@ -14681,7 +14894,7 @@
           const cell = brushCellWithAxisLock(state.interaction, event.clientX, event.clientY, rawCell.x, rawCell.y, event.shiftKey);
           const key = cell.x + ":" + cell.y + ":" + state.interaction.mode;
           if (key !== state.interaction.lastKey) {
-            const changed = paintCells(cell.x, cell.y, state.interaction.mode);
+            const changed = useVectorAuthoring() ? true : paintCells(cell.x, cell.y, state.interaction.mode);
             state.interaction.changed = state.interaction.changed || changed;
             state.interaction.lastKey = key;
             appendBrushStrokeStamp(state.interaction, cell.x, cell.y);
