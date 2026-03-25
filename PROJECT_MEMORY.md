@@ -82,6 +82,21 @@
 
 **Data model:** Painted content ανά layer, κάθε layer σε tiles (`TILE_SIZE × TILE_SIZE`), κάθε tile έχει offscreen canvas + pixel map. Μόνο visible tiles ζωγραφίζονται.
 
+**Main-canvas truth split:** Για vector-first authoring, το renderer πρέπει να κρατά καθαρά ξεχωριστά επίπεδα:
+- `layer.vectorObjects` = document/history truth
+- retained vector scene ανά layer = runtime render/query truth σε world space
+- main content scene list = stable painter ordering / query ordering
+- dirty-region redraw planner = main-canvas repaint planning πάνω από runtime invalidation signals
+- chunk/composite canvases = display cache μόνο
+
+**Invariant για το main canvas:** Το `5cm` grid παραμένει snap / measurement / discrete sizing model, αλλά τα vector shapes δεν επιτρέπεται να ξαναγίνουν per-cell display truth. Το render path πρέπει να παραμένει continuous vector-looking, ακόμα κι αν το current display backend είναι raster cache.
+
+**Dirty invalidation direction:** Τα display caches δεν πρέπει να invalidated μαζικά μόνο από global revision mismatch. Το σωστό direction είναι:
+- per-layer vector dirty chunk spans σε world space από το retained scene
+- per-layer legacy tile dirty chunk keys για compatibility tile edits
+- main-canvas dirty-region planning που συγχωνεύει μόνο τα visible affected chunk spans σε redraw regions, μαζί με pending chunk redraws από background warmup
+- append-only delta όπου είναι ασφαλές και selective rebuild όπου υπάρχει rewrite/erase/transform impact
+
 **Tile seam fix:** Tiles ζωγραφίζονται από shared snapped tile boundaries (left/top = current boundary, right/bottom = next boundary) — όχι rounded shared tileSpan. `snapPixel()` είναι device-pixel aware: `Math.round(value * ratio) / ratio`.
 
 **Sharpness:** `imageSmoothingEnabled` disabled όπου χρειάζεται. Pixel-snapped draw positions. Οποιαδήποτε επιστροφή σε blurred edges = regression.
@@ -141,4 +156,3 @@
 - `buildPlanOcclusionGrid(view)`: canonical grid για plan views
 - Debug: `DEBUG_VIEW_VECTOR_CONTOURS` (default off)
 - Limitation: geometry από 5cm base grid — fully continuous vector edges not yet implemented
-

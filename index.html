@@ -2961,7 +2961,20 @@
       const layerCompositeCtx = layerCompositeCanvas.getContext("2d");
       const vectorOpCanvas = document.createElement("canvas");
       const vectorOpCtx = vectorOpCanvas.getContext("2d");
-      const layerRenderCache = new WeakMap();
+      const layerCompositeRenderCache = new WeakMap();
+      const layerChunkRenderCache = new WeakMap();
+      const layerVectorSceneCache = new WeakMap();
+      const mainContentSceneState = {
+        structureSignature: "",
+        topEntries: [],
+        paintEntries: [],
+      };
+      const mainContentRedrawPlannerState = {
+        signature: "",
+        initialized: false,
+        forceFull: true,
+        pendingChunkKeys: new Set(),
+      };
 
       const state = {
         theme: "light",
@@ -3617,6 +3630,7 @@
 
       function restoreDocumentState(snapshot) {
         state.history.isRestoring = true;
+        invalidateMainContentRedraw();
         closeModal(ui.settingsMenu);
         closeModal(ui.sceneScaleModal);
         closeModal(ui.viewPropertiesModal);
@@ -3837,6 +3851,7 @@
 
       async function restoreProjectState(project) {
         state.history.isRestoring = true;
+        invalidateMainContentRedraw();
         try {
           closeModal(ui.settingsMenu);
           closeModal(ui.sceneScaleModal);
@@ -7064,6 +7079,7 @@
           tile.pixels.set(key, color);
           tile.dirty = true;
           layer.tileRenderRevision = (layer.tileRenderRevision || 0) + 1;
+          markLayerTileChunkDirty(layer, coords.tileX, coords.tileY);
           return true;
         }
 
@@ -7071,6 +7087,7 @@
         tile.pixels.delete(key);
         layer.cellCount -= 1;
         layer.tileRenderRevision = (layer.tileRenderRevision || 0) + 1;
+        markLayerTileChunkDirty(layer, coords.tileX, coords.tileY);
         if (!tile.pixels.size) {
           delete layer.tiles[tile.id];
           return true;
@@ -7467,27 +7484,18 @@
 
       function applyLayerVectorSnapshot(layer, vectorObjects) {
         if (!layer) return false;
+        const previousScene = ensureLayerVectorScene(layer);
+        const previousRasterBounds = previousScene.rasterBounds ? { ...previousScene.rasterBounds } : null;
+        const nextRasterBounds = vectorObjectsRasterBounds(vectorObjects);
         layer.vectorObjects = (vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
         bumpLayerVectorRevision(layer);
+        markLayerVectorSceneDirty(layer, previousRasterBounds, nextRasterBounds);
         return true;
       }
 
       function layerVectorBoundsRect(layer) {
-        const vectorRects = (layer?.vectorObjects || [])
-          .map(vectorObjectBoundsRect)
-          .filter(Boolean);
-        if (!vectorRects.length) return null;
-        return vectorRects.reduce((accumulator, rect) => ({
-          left: Math.min(accumulator.left, rect.left),
-          top: Math.min(accumulator.top, rect.top),
-          right: Math.max(accumulator.right, rect.right),
-          bottom: Math.max(accumulator.bottom, rect.bottom),
-        }), {
-          left: vectorRects[0].left,
-          top: vectorRects[0].top,
-          right: vectorRects[0].right,
-          bottom: vectorRects[0].bottom,
-        });
+        const rect = ensureLayerVectorScene(layer).authoredBounds;
+        return rect ? { ...rect } : null;
       }
 
       function combineWorldRects(a, b) {
@@ -7499,6 +7507,368 @@
           right: Math.max(a.right, b.right),
           bottom: Math.max(a.bottom, b.bottom),
         };
+      }
+
+      function combineTileSpans(a, b) {
+        if (!a) return b ? { ...b } : null;
+        if (!b) return { ...a };
+        return {
+          minTileX: Math.min(a.minTileX, b.minTileX),
+          maxTileX: Math.max(a.maxTileX, b.maxTileX),
+          minTileY: Math.min(a.minTileY, b.minTileY),
+          maxTileY: Math.max(a.maxTileY, b.maxTileY),
+        };
+      }
+
+      function parseTileKey(key) {
+        const [tileX, tileY] = String(key || "").split(":").map(Number);
+        if (!Number.isFinite(tileX) || !Number.isFinite(tileY)) return null;
+        return { tileX, tileY };
+      }
+
+      function cellBoundsWorldRect(bounds) {
+        if (!bounds) return null;
+        return {
+          left: bounds.minX * CELL_SIZE,
+          top: bounds.minY * CELL_SIZE,
+          right: (bounds.maxX + 1) * CELL_SIZE,
+          bottom: (bounds.maxY + 1) * CELL_SIZE,
+        };
+      }
+
+      function cellSnapshotWorldBoundsRect(cells, deltaX = 0, deltaY = 0) {
+        if (!Array.isArray(cells) || !cells.length) return null;
+        const bounds = cells.reduce(
+          (result, cell) => ({
+            minX: Math.min(result.minX, cell.x + deltaX),
+            minY: Math.min(result.minY, cell.y + deltaY),
+            maxX: Math.max(result.maxX, cell.x + deltaX),
+            maxY: Math.max(result.maxY, cell.y + deltaY),
+          }),
+          {
+            minX: cells[0].x + deltaX,
+            minY: cells[0].y + deltaY,
+            maxX: cells[0].x + deltaX,
+            maxY: cells[0].y + deltaY,
+          }
+        );
+        return cellBoundsWorldRect(bounds);
+      }
+
+      function layerTileWorldBoundsRect(layer) {
+        const tiles = Object.values(layer?.tiles || {});
+        if (!tiles.length) return null;
+        const tileWorldSize = TILE_SIZE * CELL_SIZE;
+        return tiles.reduce(
+          (bounds, tile) => ({
+            left: Math.min(bounds.left, tile.tileX * tileWorldSize),
+            top: Math.min(bounds.top, tile.tileY * tileWorldSize),
+            right: Math.max(bounds.right, (tile.tileX + 1) * tileWorldSize),
+            bottom: Math.max(bounds.bottom, (tile.tileY + 1) * tileWorldSize),
+          }),
+          {
+            left: tiles[0].tileX * tileWorldSize,
+            top: tiles[0].tileY * tileWorldSize,
+            right: (tiles[0].tileX + 1) * tileWorldSize,
+            bottom: (tiles[0].tileY + 1) * tileWorldSize,
+          }
+        );
+      }
+
+      function createLayerVectorScene() {
+        return {
+          sourceRevision: -1,
+          objectCount: 0,
+          updateMode: "steady",
+          nodes: [],
+          paintNodeIndices: [],
+          authoredBounds: null,
+          paintedBounds: null,
+          rasterBounds: null,
+          chunkIndex: new Map(),
+          dirtyChunkKeys: new Set(),
+        };
+      }
+
+      function vectorSceneChunkSpanFromRect(rect) {
+        if (!rect) return null;
+        const tileWorldSize = TILE_SIZE * CELL_SIZE;
+        const epsilon = 1e-6;
+        return {
+          minTileX: Math.floor(rect.left / tileWorldSize),
+          maxTileX: Math.floor((rect.right - epsilon) / tileWorldSize),
+          minTileY: Math.floor(rect.top / tileWorldSize),
+          maxTileY: Math.floor((rect.bottom - epsilon) / tileWorldSize),
+        };
+      }
+
+      function createLayerVectorSceneNode(vectorObject, order) {
+        const source = cloneVectorObjectForSnapshot(vectorObject);
+        if (!source) return null;
+        const authoredBounds = vectorObjectBoundsRect(source);
+        const outlineWidth = vectorOutlineWidthWorld(source.style || {});
+        const expandedBounds = authoredBounds
+          ? {
+              left: authoredBounds.left - outlineWidth,
+              top: authoredBounds.top - outlineWidth,
+              right: authoredBounds.right + outlineWidth,
+              bottom: authoredBounds.bottom + outlineWidth,
+            }
+          : null;
+        return {
+          id: typeof source.id === "string" ? source.id : generateVectorObjectId(),
+          order,
+          sourceRef: vectorObject,
+          vectorObject: source,
+          compositeMode: source.compositeMode === "erase" ? "erase" : "paint",
+          authoredBounds,
+          expandedBounds,
+          chunkSpan: vectorSceneChunkSpanFromRect(expandedBounds || authoredBounds),
+        };
+      }
+
+      function appendLayerVectorSceneNode(scene, vectorObject, order) {
+        const node = createLayerVectorSceneNode(vectorObject, order);
+        if (!node) return;
+        const nodeIndex = scene.nodes.length;
+        scene.nodes.push(node);
+        scene.authoredBounds = combineWorldRects(scene.authoredBounds, node.authoredBounds);
+        scene.rasterBounds = combineWorldRects(scene.rasterBounds, node.expandedBounds || node.authoredBounds);
+        if (node.compositeMode !== "erase") {
+          scene.paintNodeIndices.push(nodeIndex);
+          scene.paintedBounds = combineWorldRects(scene.paintedBounds, node.authoredBounds);
+        }
+        if (!node.chunkSpan) return;
+        for (let tileY = node.chunkSpan.minTileY; tileY <= node.chunkSpan.maxTileY; tileY += 1) {
+          for (let tileX = node.chunkSpan.minTileX; tileX <= node.chunkSpan.maxTileX; tileX += 1) {
+            const key = tileKey(tileX, tileY);
+            let indices = scene.chunkIndex.get(key);
+            if (!indices) {
+              indices = [];
+              scene.chunkIndex.set(key, indices);
+            }
+            indices.push(nodeIndex);
+          }
+        }
+      }
+
+      function rebuildLayerVectorScene(scene, layer) {
+        scene.nodes = [];
+        scene.paintNodeIndices = [];
+        scene.authoredBounds = null;
+        scene.paintedBounds = null;
+        scene.rasterBounds = null;
+        scene.chunkIndex = new Map();
+        const vectorObjects = layer?.vectorObjects || [];
+        vectorObjects.forEach((vectorObject, index) => {
+          appendLayerVectorSceneNode(scene, vectorObject, index);
+        });
+        scene.objectCount = vectorObjects.length;
+        scene.sourceRevision = layer?.vectorRenderRevision || 0;
+        scene.updateMode = "rebuild";
+        return scene;
+      }
+
+      function layerVectorSceneCanAppend(scene, layer) {
+        const vectorObjects = layer?.vectorObjects || [];
+        if (vectorObjects.length < scene.objectCount) return false;
+        for (let index = 0; index < scene.objectCount; index += 1) {
+          if (scene.nodes[index]?.sourceRef !== vectorObjects[index]) return false;
+        }
+        return true;
+      }
+
+      function ensureLayerVectorScene(layer) {
+        if (!layer || typeof layer !== "object") return createLayerVectorScene();
+        let scene = layerVectorSceneCache.get(layer);
+        if (!scene) {
+          scene = createLayerVectorScene();
+          layerVectorSceneCache.set(layer, scene);
+        }
+        const sourceRevision = layer?.vectorRenderRevision || 0;
+        const vectorObjects = layer?.vectorObjects || [];
+        const objectCount = vectorObjects.length;
+
+        if (objectCount < scene.objectCount) {
+          return rebuildLayerVectorScene(scene, layer);
+        }
+
+        if (scene.sourceRevision !== sourceRevision) {
+          if (objectCount > scene.objectCount && layerVectorSceneCanAppend(scene, layer)) {
+            for (let index = scene.objectCount; index < objectCount; index += 1) {
+              appendLayerVectorSceneNode(scene, vectorObjects[index], index);
+            }
+            scene.objectCount = objectCount;
+            scene.sourceRevision = sourceRevision;
+            scene.updateMode = "append";
+            return scene;
+          }
+          return rebuildLayerVectorScene(scene, layer);
+        }
+
+        if (objectCount > scene.objectCount) {
+          if (!layerVectorSceneCanAppend(scene, layer)) {
+            return rebuildLayerVectorScene(scene, layer);
+          }
+          for (let index = scene.objectCount; index < objectCount; index += 1) {
+            appendLayerVectorSceneNode(scene, vectorObjects[index], index);
+          }
+          scene.objectCount = objectCount;
+          scene.updateMode = "append";
+        }
+
+        return scene;
+      }
+
+      function layerVectorScenePointCandidateIndices(scene, worldX, worldY) {
+        if (!scene?.nodes.length) return [];
+        const tileWorldSize = TILE_SIZE * CELL_SIZE;
+        const epsilon = 1e-6;
+        const tileXs = new Set([Math.floor(worldX / tileWorldSize), Math.floor((worldX - epsilon) / tileWorldSize)]);
+        const tileYs = new Set([Math.floor(worldY / tileWorldSize), Math.floor((worldY - epsilon) / tileWorldSize)]);
+        const indices = new Set();
+        tileYs.forEach((tileY) => {
+          tileXs.forEach((tileX) => {
+            (scene.chunkIndex.get(tileKey(tileX, tileY)) || []).forEach((index) => indices.add(index));
+          });
+        });
+        return Array.from(indices).sort((a, b) => a - b);
+      }
+
+      function markLayerVectorSceneRectDirty(layer, rect) {
+        if (!layer || !rect) return false;
+        const scene = ensureLayerVectorScene(layer);
+        const span = vectorSceneChunkSpanFromRect(rect);
+        if (!span) return false;
+        for (let tileY = span.minTileY; tileY <= span.maxTileY; tileY += 1) {
+          for (let tileX = span.minTileX; tileX <= span.maxTileX; tileX += 1) {
+            scene.dirtyChunkKeys.add(tileKey(tileX, tileY));
+          }
+        }
+        return true;
+      }
+
+      function markLayerVectorSceneDirty(layer, previousRect, nextRect) {
+        const markedPrevious = markLayerVectorSceneRectDirty(layer, previousRect);
+        const markedNext = markLayerVectorSceneRectDirty(layer, nextRect);
+        return markedPrevious || markedNext;
+      }
+
+      function markLayerTileChunkDirty(layer, tileX, tileY) {
+        if (!layer || !Number.isFinite(tileX) || !Number.isFinite(tileY)) return false;
+        const cache = ensureLayerChunkCache(layer);
+        cache.dirtyTileChunkKeys.add(tileKey(tileX, tileY));
+        return true;
+      }
+
+      function markLayerTileRectDirty(layer, rect) {
+        if (!layer || !rect) return false;
+        const cache = ensureLayerChunkCache(layer);
+        const span = vectorSceneChunkSpanFromRect(rect);
+        if (!span) return false;
+        for (let tileY = span.minTileY; tileY <= span.maxTileY; tileY += 1) {
+          for (let tileX = span.minTileX; tileX <= span.maxTileX; tileX += 1) {
+            cache.dirtyTileChunkKeys.add(tileKey(tileX, tileY));
+          }
+        }
+        return true;
+      }
+
+      function markLayerTileDirty(layer, previousRect, nextRect) {
+        const markedPrevious = markLayerTileRectDirty(layer, previousRect);
+        const markedNext = markLayerTileRectDirty(layer, nextRect);
+        return markedPrevious || markedNext;
+      }
+
+      function vectorObjectsRasterBounds(vectorObjects) {
+        return (vectorObjects || []).reduce((accumulator, vectorObject) => {
+          const rect = expandedVectorObjectBoundsRect(vectorObject);
+          return combineWorldRects(accumulator, rect);
+        }, null);
+      }
+
+      function currentMainContentSceneStructureSignature() {
+        return state.drawings
+          .map((drawing) =>
+            [
+              drawing.id,
+              drawing.visible === false ? 0 : 1,
+              drawing.layers.map((layer) => [layer.id, layer.visible === false ? 0 : 1].join(":")).join(","),
+            ].join("|")
+          )
+          .join("||");
+      }
+
+      function rebuildMainContentScene() {
+        const topEntries = [];
+        state.drawings.forEach((drawing) => {
+          if (drawing.visible === false) return;
+          drawing.layers.forEach((layer) => {
+            if (!layer?.visible) return;
+            topEntries.push({
+              key: drawing.id + ":" + layer.id,
+              drawing,
+              drawingId: drawing.id,
+              layer,
+              layerId: layer.id,
+              vectorScene: ensureLayerVectorScene(layer),
+            });
+          });
+        });
+        mainContentSceneState.topEntries = topEntries;
+        mainContentSceneState.paintEntries = [...topEntries].reverse();
+        mainContentSceneState.structureSignature = currentMainContentSceneStructureSignature();
+        return mainContentSceneState;
+      }
+
+      function ensureMainContentScene() {
+        const signature = currentMainContentSceneStructureSignature();
+        if (mainContentSceneState.structureSignature !== signature) {
+          return rebuildMainContentScene();
+        }
+        mainContentSceneState.topEntries.forEach((entry) => {
+          entry.vectorScene = ensureLayerVectorScene(entry.layer);
+        });
+        return mainContentSceneState;
+      }
+
+      function currentMainContentDisplaySignature() {
+        const sceneState = ensureMainContentScene();
+        const opacitySignature = sceneState.paintEntries
+          .map((entry) => entry.layerId + ":" + String(entry.layer.opacity))
+          .join(",");
+        return [
+          sceneState.structureSignature,
+          opacitySignature,
+          ui.contentCanvas.width,
+          ui.contentCanvas.height,
+          state.viewport.x,
+          state.viewport.y,
+          state.viewport.zoom,
+          window.devicePixelRatio || 1,
+        ].join("|");
+      }
+
+      function invalidateMainContentRedraw() {
+        mainContentRedrawPlannerState.forceFull = true;
+      }
+
+      function queueMainContentChunkRedraw(tileX, tileY) {
+        if (!Number.isFinite(tileX) || !Number.isFinite(tileY)) return false;
+        mainContentRedrawPlannerState.pendingChunkKeys.add(tileKey(tileX, tileY));
+        return true;
+      }
+
+      function clearMainContentPendingChunkKeys(bounds = null) {
+        if (!bounds) {
+          mainContentRedrawPlannerState.pendingChunkKeys.clear();
+          return;
+        }
+        for (let tileY = bounds.minTileY; tileY <= bounds.maxTileY; tileY += 1) {
+          for (let tileX = bounds.minTileX; tileX <= bounds.maxTileX; tileX += 1) {
+            mainContentRedrawPlannerState.pendingChunkKeys.delete(tileKey(tileX, tileY));
+          }
+        }
       }
 
       function layerWorldBoundsRect(layer) {
@@ -7751,11 +8121,14 @@
 
       function applyLayerCellSnapshot(layer, cells, deltaX, deltaY) {
         if (!layer) return false;
+        const previousRasterBounds = layerTileWorldBoundsRect(layer);
+        const nextRasterBounds = cellSnapshotWorldBoundsRect(cells, deltaX, deltaY);
         layer.tiles = {};
         layer.cellCount = 0;
         cells.forEach((cell) => {
           setCellColor(layer, cell.x + deltaX, cell.y + deltaY, cell.color);
         });
+        markLayerTileDirty(layer, previousRasterBounds, nextRasterBounds);
         return true;
       }
 
@@ -11514,6 +11887,7 @@
         resizeCanvas(ui.rulerLeft, rulerLeftCtx);
         resizeCanvas(ui.rulerBottom, rulerBottomCtx);
         resizeCanvas(ui.rulerRight, rulerRightCtx);
+        invalidateMainContentRedraw();
         render({ ui: true, static: true, scenes: true, content: true, overlay: true, rulers: true });
       }
 
@@ -11610,7 +11984,7 @@
       }
 
       function ensureCachedLayerSurface(layer, width, height) {
-        let cache = layerRenderCache.get(layer);
+        let cache = layerCompositeRenderCache.get(layer);
         if (!cache) {
           const canvas = document.createElement("canvas");
           const context = canvas.getContext("2d");
@@ -11620,8 +11994,9 @@
             signature: null,
             tileRenderRevision: -1,
             vectorCount: 0,
+            vectorRenderRevision: -1,
           };
-          layerRenderCache.set(layer, cache);
+          layerCompositeRenderCache.set(layer, cache);
         }
         if (cache.canvas.width !== width) cache.canvas.width = width;
         if (cache.canvas.height !== height) cache.canvas.height = height;
@@ -11751,7 +12126,7 @@
 
       function vectorObjectPixelBounds(vectorObject, canvasWidth, canvasHeight, projectPoint = worldToScreen) {
         const ratio = window.devicePixelRatio || 1;
-        const rect = expandedVectorObjectBoundsRect(vectorObject);
+        const rect = vectorObject?.expandedBounds || expandedVectorObjectBoundsRect(vectorObject?.vectorObject || vectorObject);
         if (!rect) return null;
         const paddingPx = 2;
         const topLeft = projectPoint(rect.left, rect.top);
@@ -11812,27 +12187,27 @@
       }
 
       function drawLayerVectorObjectsToContext(context, layer, startIndex = 0) {
+        const scene = ensureLayerVectorScene(layer);
         const opContext = ensureVectorOpSurface(context.canvas.width, context.canvas.height);
-        for (let index = startIndex; index < (layer.vectorObjects || []).length; index += 1) {
-          const vectorObject = layer.vectorObjects[index];
-          const pixelBounds = vectorObjectPixelBounds(vectorObject, context.canvas.width, context.canvas.height);
+        for (let index = startIndex; index < scene.nodes.length; index += 1) {
+          const node = scene.nodes[index];
+          const pixelBounds = vectorObjectPixelBounds(node, context.canvas.width, context.canvas.height);
           if (!pixelBounds) continue;
-          compositeVectorObjectToLayerContext(context, opContext, vectorObject, pixelBounds);
+          compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds);
         }
       }
 
       function ensureLayerChunkCache(layer) {
-        let cache = layerRenderCache.get(layer);
+        let cache = layerChunkRenderCache.get(layer);
         if (!cache) {
           cache = {
             zoomKey: "",
             tileRenderRevision: -1,
             vectorRenderRevision: -1,
             chunkCanvases: new Map(),
-            chunkIndex: new Map(),
-            indexedCount: 0,
+            dirtyTileChunkKeys: new Set(),
           };
-          layerRenderCache.set(layer, cache);
+          layerChunkRenderCache.set(layer, cache);
         }
         return cache;
       }
@@ -11856,49 +12231,10 @@
         cache.chunkCanvases.clear();
       }
 
-      function vectorObjectChunkSpan(vectorObject) {
-        const rect = expandedVectorObjectBoundsRect(vectorObject);
-        if (!rect) return null;
-        const tileWorldSize = TILE_SIZE * CELL_SIZE;
-        const epsilon = 1e-6;
-        return {
-          minTileX: Math.floor(rect.left / tileWorldSize),
-          maxTileX: Math.floor((rect.right - epsilon) / tileWorldSize),
-          minTileY: Math.floor(rect.top / tileWorldSize),
-          maxTileY: Math.floor((rect.bottom - epsilon) / tileWorldSize),
-        };
-      }
-
       function ensureLayerVectorChunkIndex(layer, cache) {
-        const vectorCount = (layer.vectorObjects || []).length;
-        if (cache.vectorRenderRevision !== (layer.vectorRenderRevision || 0)) {
-          cache.vectorRenderRevision = layer.vectorRenderRevision || 0;
-          cache.chunkIndex = new Map();
-          cache.indexedCount = 0;
-          clearLayerChunkCanvases(cache);
-        }
-        if (vectorCount < cache.indexedCount) {
-          cache.chunkIndex = new Map();
-          cache.indexedCount = 0;
-          clearLayerChunkCanvases(cache);
-        }
-        for (let index = cache.indexedCount; index < vectorCount; index += 1) {
-          const vectorObject = layer.vectorObjects[index];
-          const span = vectorObjectChunkSpan(vectorObject);
-          if (!span) continue;
-          for (let tileY = span.minTileY; tileY <= span.maxTileY; tileY += 1) {
-            for (let tileX = span.minTileX; tileX <= span.maxTileX; tileX += 1) {
-              const key = tileKey(tileX, tileY);
-              let indices = cache.chunkIndex.get(key);
-              if (!indices) {
-                indices = [];
-                cache.chunkIndex.set(key, indices);
-              }
-              indices.push(index);
-            }
-          }
-        }
-        cache.indexedCount = vectorCount;
+        const scene = ensureLayerVectorScene(layer);
+        cache.vectorRenderRevision = scene.sourceRevision;
+        return scene;
       }
 
       function ensureChunkCanvas(entry, size) {
@@ -11922,7 +12258,7 @@
         });
       }
 
-      function rebuildLayerChunk(cache, entry, layer, tileX, tileY, tileSpan) {
+      function rebuildLayerChunk(cache, scene, entry, layer, tileX, tileY, tileSpan) {
         const context = ensureChunkCanvas(entry, tileSpan);
         context.clearRect(0, 0, entry.canvas.width, entry.canvas.height);
         const tile = layer.tiles[tileKey(tileX, tileY)];
@@ -11932,46 +12268,42 @@
         }
         const projectPoint = chunkProjectPoint(tileX, tileY);
         const opContext = ensureVectorOpSurface(entry.canvas.width, entry.canvas.height);
-        const chunkIndices = cache.chunkIndex.get(tileKey(tileX, tileY)) || [];
+        const chunkIndices = scene.chunkIndex.get(tileKey(tileX, tileY)) || [];
         for (const index of chunkIndices) {
-          const vectorObject = layer.vectorObjects[index];
-          const pixelBounds = vectorObjectPixelBounds(vectorObject, entry.canvas.width, entry.canvas.height, projectPoint);
+          const node = scene.nodes[index];
+          const pixelBounds = vectorObjectPixelBounds(node, entry.canvas.width, entry.canvas.height, projectPoint);
           if (!pixelBounds) continue;
-          compositeVectorObjectToLayerContext(context, opContext, vectorObject, pixelBounds, projectPoint);
+          compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds, projectPoint);
         }
-        entry.vectorCount = (layer.vectorObjects || []).length;
+        entry.vectorCount = scene.nodes.length;
         entry.tileRenderRevision = layer.tileRenderRevision || 0;
         entry.zoomKey = cache.zoomKey;
-        entry.vectorRenderRevision = layer.vectorRenderRevision || 0;
+        entry.vectorRenderRevision = scene.sourceRevision;
       }
 
-      function appendLayerChunkVectorDelta(cache, entry, layer, tileX, tileY) {
+      function appendLayerChunkVectorDelta(scene, entry, layer, tileX, tileY) {
         const context = ensureChunkCanvas(entry, TILE_SIZE * CELL_SIZE * state.viewport.zoom);
         const projectPoint = chunkProjectPoint(tileX, tileY);
         const opContext = ensureVectorOpSurface(entry.canvas.width, entry.canvas.height);
-        const chunkIndices = cache.chunkIndex.get(tileKey(tileX, tileY)) || [];
+        const chunkIndices = scene.chunkIndex.get(tileKey(tileX, tileY)) || [];
         for (const index of chunkIndices) {
           if (index < entry.vectorCount) continue;
-          const vectorObject = layer.vectorObjects[index];
-          const pixelBounds = vectorObjectPixelBounds(vectorObject, entry.canvas.width, entry.canvas.height, projectPoint);
+          const node = scene.nodes[index];
+          const pixelBounds = vectorObjectPixelBounds(node, entry.canvas.width, entry.canvas.height, projectPoint);
           if (!pixelBounds) continue;
-          compositeVectorObjectToLayerContext(context, opContext, vectorObject, pixelBounds, projectPoint);
+          compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds, projectPoint);
         }
-        entry.vectorCount = (layer.vectorObjects || []).length;
-        entry.vectorRenderRevision = layer.vectorRenderRevision || 0;
+        entry.vectorCount = scene.nodes.length;
+        entry.vectorRenderRevision = scene.sourceRevision;
       }
 
       function drawLayerVisibleChunksToContent(layer, bounds, tileSpan) {
         const cache = ensureLayerChunkCache(layer);
+        const scene = ensureLayerVectorChunkIndex(layer, cache);
         const nextZoomKey = layerChunkZoomKey();
         const tileRevision = layer.tileRenderRevision || 0;
-        const vectorRevision = layer.vectorRenderRevision || 0;
         cache.zoomKey = nextZoomKey;
-        if (cache.tileRenderRevision !== tileRevision) {
-          cache.tileRenderRevision = tileRevision;
-          clearLayerChunkCanvases(cache);
-        }
-        ensureLayerVectorChunkIndex(layer, cache);
+        cache.tileRenderRevision = tileRevision;
 
         contentCtx.save();
         contentCtx.globalAlpha = layer.opacity;
@@ -11990,15 +12322,20 @@
               };
               cache.chunkCanvases.set(key, entry);
             }
-            const currentVectorCount = (layer.vectorObjects || []).length;
-            const needsRebuild =
-              entry.tileRenderRevision !== tileRevision ||
-              entry.vectorRenderRevision !== vectorRevision ||
-              entry.vectorCount > currentVectorCount;
-            if (needsRebuild) rebuildLayerChunk(cache, entry, layer, tileX, tileY, tileSpan);
-            else if (entry.vectorCount < currentVectorCount) {
-              if (entry.zoomKey !== cache.zoomKey) rebuildLayerChunk(cache, entry, layer, tileX, tileY, tileSpan);
-              else appendLayerChunkVectorDelta(cache, entry, layer, tileX, tileY);
+            const tileChunkDirty = cache.dirtyTileChunkKeys.has(key);
+            const vectorChunkDirty = scene.dirtyChunkKeys.has(key);
+            const needsChunkRebuild = !entry.canvas || entry.zoomKey !== cache.zoomKey;
+            if (needsChunkRebuild || tileChunkDirty) {
+              rebuildLayerChunk(cache, scene, entry, layer, tileX, tileY, tileSpan);
+              cache.dirtyTileChunkKeys.delete(key);
+              scene.dirtyChunkKeys.delete(key);
+            } else if (vectorChunkDirty) {
+              if (scene.updateMode !== "append" || entry.vectorCount >= scene.nodes.length) {
+                rebuildLayerChunk(cache, scene, entry, layer, tileX, tileY, tileSpan);
+              } else {
+                appendLayerChunkVectorDelta(scene, entry, layer, tileX, tileY);
+              }
+              scene.dirtyChunkKeys.delete(key);
             }
             const screenX = snapPixel(state.viewport.x + tileX * tileSpan);
             const screenY = snapPixel(state.viewport.y + tileY * tileSpan);
@@ -12027,28 +12364,27 @@
       function collectVisibleChunkWarmupQueue() {
         const bounds = visibleTileBounds();
         const queue = [];
-        for (const layer of [...getAllLayers()].reverse()) {
-          if (!layer.visible) continue;
-          if (findDrawingForLayer(layer.id)?.visible === false) continue;
+        for (const entry of ensureMainContentScene().paintEntries) {
+          const layer = entry.layer;
           const cache = ensureLayerChunkCache(layer);
-          const currentVectorCount = (layer.vectorObjects || []).length;
-          const tileRevision = layer.tileRenderRevision || 0;
-          const vectorRevision = layer.vectorRenderRevision || 0;
+          const scene = entry.vectorScene;
           const zoomKey = layerChunkZoomKey();
           for (let tileY = bounds.minTileY; tileY <= bounds.maxTileY; tileY += 1) {
             for (let tileX = bounds.minTileX; tileX <= bounds.maxTileX; tileX += 1) {
               const key = tileKey(tileX, tileY);
               const entry = cache.chunkCanvases.get(key);
+              const tileChunkDirty = cache.dirtyTileChunkKeys.has(key);
+              const vectorChunkDirty = scene.dirtyChunkKeys.has(key);
               if (
                 entry &&
+                !tileChunkDirty &&
+                !vectorChunkDirty &&
                 entry.zoomKey === zoomKey &&
-                entry.tileRenderRevision === tileRevision &&
-                entry.vectorRenderRevision === vectorRevision &&
-                entry.vectorCount === currentVectorCount
+                !!entry.canvas
               ) {
                 continue;
               }
-              queue.push({ layer, tileX, tileY });
+              queue.push({ layer, tileX, tileY, key });
             }
           }
         }
@@ -12071,16 +12407,10 @@
         while (remainingBudget > 0 && state.chunkWarmup.queue.length) {
           const task = state.chunkWarmup.queue.shift();
           const layer = task.layer;
-          if (!layer?.visible) continue;
-          if (findDrawingForLayer(layer.id)?.visible === false) continue;
           const cache = ensureLayerChunkCache(layer);
           cache.zoomKey = layerChunkZoomKey();
-          const tileRevision = layer.tileRenderRevision || 0;
-          if (cache.tileRenderRevision !== tileRevision) {
-            cache.tileRenderRevision = tileRevision;
-            clearLayerChunkCanvases(cache);
-          }
-          ensureLayerVectorChunkIndex(layer, cache);
+          const scene = ensureLayerVectorChunkIndex(layer, cache);
+          cache.tileRenderRevision = layer.tileRenderRevision || 0;
           const key = tileKey(task.tileX, task.tileY);
           let entry = cache.chunkCanvases.get(key);
           if (!entry) {
@@ -12094,17 +12424,23 @@
             };
             cache.chunkCanvases.set(key, entry);
           }
-          const currentVectorCount = (layer.vectorObjects || []).length;
-          const needsRebuild =
-            entry.zoomKey !== cache.zoomKey ||
-            entry.tileRenderRevision !== tileRevision ||
-            entry.vectorRenderRevision !== (layer.vectorRenderRevision || 0) ||
-            entry.vectorCount > currentVectorCount;
-          if (needsRebuild) {
-            rebuildLayerChunk(cache, entry, layer, task.tileX, task.tileY, tileSpan);
+          const tileChunkDirty = cache.dirtyTileChunkKeys.has(key);
+          const vectorChunkDirty = scene.dirtyChunkKeys.has(key);
+          const needsRebuild = entry.zoomKey !== cache.zoomKey || !entry.canvas;
+          if (needsRebuild || tileChunkDirty) {
+            rebuildLayerChunk(cache, scene, entry, layer, task.tileX, task.tileY, tileSpan);
+            cache.dirtyTileChunkKeys.delete(key);
+            scene.dirtyChunkKeys.delete(key);
+            queueMainContentChunkRedraw(task.tileX, task.tileY);
             changed = true;
-          } else if (entry.vectorCount < currentVectorCount) {
-            appendLayerChunkVectorDelta(cache, entry, layer, task.tileX, task.tileY);
+          } else if (vectorChunkDirty) {
+            if (scene.updateMode === "append" && entry.vectorCount < scene.nodes.length) {
+              appendLayerChunkVectorDelta(scene, entry, layer, task.tileX, task.tileY);
+            } else {
+              rebuildLayerChunk(cache, scene, entry, layer, task.tileX, task.tileY, tileSpan);
+            }
+            scene.dirtyChunkKeys.delete(key);
+            queueMainContentChunkRedraw(task.tileX, task.tileY);
             changed = true;
           }
           remainingBudget -= 1;
@@ -12129,30 +12465,176 @@
         }, delayMs);
       }
 
+      function tileSpansIntersect(a, b) {
+        return !(a.maxTileX < b.minTileX || a.minTileX > b.maxTileX || a.maxTileY < b.minTileY || a.minTileY > b.maxTileY);
+      }
+
+      function layerTileChunkBounds(layer, scene = ensureLayerVectorScene(layer)) {
+        let tileSpan = null;
+        const tiles = Object.values(layer?.tiles || {});
+        if (tiles.length) {
+          tileSpan = tiles.reduce(
+            (bounds, tile) => ({
+              minTileX: Math.min(bounds.minTileX, tile.tileX),
+              maxTileX: Math.max(bounds.maxTileX, tile.tileX),
+              minTileY: Math.min(bounds.minTileY, tile.tileY),
+              maxTileY: Math.max(bounds.maxTileY, tile.tileY),
+            }),
+            {
+              minTileX: tiles[0].tileX,
+              maxTileX: tiles[0].tileX,
+              minTileY: tiles[0].tileY,
+              maxTileY: tiles[0].tileY,
+            }
+          );
+        }
+        const vectorSpan = scene?.rasterBounds ? vectorSceneChunkSpanFromRect(scene.rasterBounds) : null;
+        return combineTileSpans(tileSpan, vectorSpan);
+      }
+
+      function tileSpanScreenRect(bounds) {
+        if (!bounds) return null;
+        const width = ui.contentCanvas.clientWidth;
+        const height = ui.contentCanvas.clientHeight;
+        const tileSpan = TILE_SIZE * CELL_SIZE * state.viewport.zoom;
+        const left = Math.max(0, Math.min(width, snapPixel(state.viewport.x + bounds.minTileX * tileSpan, "floor")));
+        const top = Math.max(0, Math.min(height, snapPixel(state.viewport.y + bounds.minTileY * tileSpan, "floor")));
+        const right = Math.max(0, Math.min(width, snapPixel(state.viewport.x + (bounds.maxTileX + 1) * tileSpan, "ceil")));
+        const bottom = Math.max(0, Math.min(height, snapPixel(state.viewport.y + (bounds.maxTileY + 1) * tileSpan, "ceil")));
+        if (right <= left || bottom <= top) return null;
+        return {
+          x: left,
+          y: top,
+          width: right - left,
+          height: bottom - top,
+        };
+      }
+
+      function buildDirtyChunkRegions(keysByRow) {
+        const sortedRows = Array.from(keysByRow.keys()).sort((a, b) => a - b);
+        const regions = [];
+        let activeRegions = new Map();
+
+        sortedRows.forEach((tileY) => {
+          const xs = Array.from(keysByRow.get(tileY) || []).sort((a, b) => a - b);
+          const spans = [];
+          xs.forEach((tileX) => {
+            const current = spans[spans.length - 1];
+            if (current && tileX === current.maxTileX + 1) {
+              current.maxTileX = tileX;
+              return;
+            }
+            spans.push({ minTileX: tileX, maxTileX: tileX });
+          });
+
+          const nextActive = new Map();
+          spans.forEach((span) => {
+            const spanKey = span.minTileX + ":" + span.maxTileX;
+            const existing = activeRegions.get(spanKey);
+            if (existing && existing.maxTileY === tileY - 1) {
+              existing.maxTileY = tileY;
+              nextActive.set(spanKey, existing);
+              return;
+            }
+            const region = {
+              minTileX: span.minTileX,
+              maxTileX: span.maxTileX,
+              minTileY: tileY,
+              maxTileY: tileY,
+            };
+            regions.push(region);
+            nextActive.set(spanKey, region);
+          });
+          activeRegions = nextActive;
+        });
+
+        return regions;
+      }
+
+      function collectVisibleDirtyContentRegions() {
+        const bounds = visibleTileBounds();
+        const keysByRow = new Map();
+        const collectKey = (key) => {
+          const coords = parseTileKey(key);
+          if (!coords) return;
+          if (
+            coords.tileX < bounds.minTileX ||
+            coords.tileX > bounds.maxTileX ||
+            coords.tileY < bounds.minTileY ||
+            coords.tileY > bounds.maxTileY
+          ) {
+            return;
+          }
+          let row = keysByRow.get(coords.tileY);
+          if (!row) {
+            row = new Set();
+            keysByRow.set(coords.tileY, row);
+          }
+          row.add(coords.tileX);
+        };
+
+        ensureMainContentScene().paintEntries.forEach((entry) => {
+          const cache = ensureLayerChunkCache(entry.layer);
+          entry.vectorScene.dirtyChunkKeys.forEach(collectKey);
+          cache.dirtyTileChunkKeys.forEach(collectKey);
+        });
+        mainContentRedrawPlannerState.pendingChunkKeys.forEach(collectKey);
+
+        return buildDirtyChunkRegions(keysByRow)
+          .map((region) => {
+            const screenRect = tileSpanScreenRect(region);
+            return screenRect ? { ...region, screenRect } : null;
+          })
+          .filter(Boolean);
+      }
+
+      function drawContentRegion(region, sceneState, width, height, tileSpan) {
+        contentCtx.clearRect(region.screenRect.x, region.screenRect.y, region.screenRect.width, region.screenRect.height);
+        sceneState.paintEntries.forEach((entry) => {
+          const layerBounds = layerTileChunkBounds(entry.layer, entry.vectorScene);
+          if (!layerBounds || !tileSpansIntersect(layerBounds, region)) return;
+          if (isLayerUnderLiveTransform(entry.layer.id)) {
+            contentCtx.save();
+            contentCtx.beginPath();
+            contentCtx.rect(region.screenRect.x, region.screenRect.y, region.screenRect.width, region.screenRect.height);
+            contentCtx.clip();
+            drawLayerDirectToContent(entry.layer, width, height, region, tileSpan);
+            contentCtx.restore();
+            return;
+          }
+          drawLayerVisibleChunksToContent(entry.layer, region, tileSpan);
+        });
+        clearMainContentPendingChunkKeys(region);
+      }
+
       function rebuildCachedLayerComposite(cache, layer, width, height, bounds, tileSpan, signature) {
+        const scene = ensureLayerVectorScene(layer);
         cache.context.clearRect(0, 0, width, height);
         drawLayerTilesToContext(cache.context, layer, bounds, tileSpan);
         drawLayerVectorObjectsToContext(cache.context, layer, 0);
         cache.signature = signature;
         cache.tileRenderRevision = layer.tileRenderRevision || 0;
-        cache.vectorCount = (layer.vectorObjects || []).length;
+        cache.vectorCount = scene.nodes.length;
+        cache.vectorRenderRevision = scene.sourceRevision;
       }
 
       function drawLayerCompositeToContent(layer, width, height, bounds, tileSpan) {
         const signature = layerViewportRenderSignature(width, height);
         const cache = ensureCachedLayerSurface(layer, width, height);
+        const scene = ensureLayerVectorScene(layer);
         const tileRevision = layer.tileRenderRevision || 0;
-        const vectorCount = (layer.vectorObjects || []).length;
+        const vectorCount = scene.nodes.length;
         const viewportChanged = cache.signature !== signature;
         const tilesChanged = cache.tileRenderRevision !== tileRevision;
-        const vectorRewound = vectorCount < cache.vectorCount;
-        const needsFullRebuild = viewportChanged || tilesChanged || vectorRewound;
+        const vectorChanged = cache.vectorRenderRevision !== scene.sourceRevision;
+        const needsFullRebuild = viewportChanged || tilesChanged || vectorChanged || vectorCount < cache.vectorCount;
 
         if (needsFullRebuild) {
           rebuildCachedLayerComposite(cache, layer, width, height, bounds, tileSpan, signature);
         } else if (vectorCount > cache.vectorCount) {
           drawLayerVectorObjectsToContext(cache.context, layer, cache.vectorCount);
           cache.vectorCount = vectorCount;
+          cache.vectorRenderRevision = scene.sourceRevision;
         }
 
         contentCtx.save();
@@ -12182,20 +12664,42 @@
       function drawContentScene() {
         const width = ui.contentCanvas.clientWidth;
         const height = ui.contentCanvas.clientHeight;
-        const cellSpan = CELL_SIZE * state.viewport.zoom;
-        const tileSpan = TILE_SIZE * cellSpan;
+        const tileSpan = TILE_SIZE * CELL_SIZE * state.viewport.zoom;
         const bounds = visibleTileBounds();
-        contentCtx.clearRect(0, 0, width, height);
+        const sceneState = ensureMainContentScene();
+        const displaySignature = currentMainContentDisplaySignature();
+        const needsFullRedraw =
+          mainContentRedrawPlannerState.forceFull ||
+          !mainContentRedrawPlannerState.initialized ||
+          mainContentRedrawPlannerState.signature !== displaySignature;
 
-        [...getAllLayers()].reverse().forEach((layer) => {
-          if (!layer.visible) return;
-          if (findDrawingForLayer(layer.id)?.visible === false) return;
-          if (isLayerUnderLiveTransform(layer.id)) {
-            drawLayerDirectToContent(layer, width, height, bounds, tileSpan);
+        if (needsFullRedraw) {
+          contentCtx.clearRect(0, 0, width, height);
+          sceneState.paintEntries.forEach((entry) => {
+            const layer = entry.layer;
+            if (isLayerUnderLiveTransform(layer.id)) {
+              drawLayerDirectToContent(layer, width, height, bounds, tileSpan);
+              return;
+            }
+            drawLayerVisibleChunksToContent(layer, bounds, tileSpan);
+          });
+          clearMainContentPendingChunkKeys();
+        } else {
+          const dirtyRegions = collectVisibleDirtyContentRegions();
+          if (!dirtyRegions.length) {
+            mainContentRedrawPlannerState.signature = displaySignature;
+            mainContentRedrawPlannerState.initialized = true;
+            mainContentRedrawPlannerState.forceFull = false;
             return;
           }
-          drawLayerVisibleChunksToContent(layer, bounds, tileSpan);
-        });
+          dirtyRegions.forEach((region) => {
+            drawContentRegion(region, sceneState, width, height, tileSpan);
+          });
+        }
+
+        mainContentRedrawPlannerState.signature = displaySignature;
+        mainContentRedrawPlannerState.initialized = true;
+        mainContentRedrawPlannerState.forceFull = false;
       }
 
       function measurementPointWorld(point) {
@@ -14175,6 +14679,7 @@
 
       function appendVectorObject(layer, vectorObject) {
         if (!layer || !vectorObject) return false;
+        markLayerVectorSceneRectDirty(layer, expandedVectorObjectBoundsRect(vectorObject));
         layer.vectorObjects.push(vectorObject);
         bumpLayerVectorRevision(layer);
         return true;
@@ -14623,10 +15128,14 @@
 
       function sampleVectorColorAt(layer, worldX, worldY) {
         if (!layer) return null;
+        const scene = ensureLayerVectorScene(layer);
+        const candidateIndices = layerVectorScenePointCandidateIndices(scene, worldX, worldY);
+        if (!candidateIndices.length) return null;
         let visible = false;
         let color = null;
-        (layer.vectorObjects || []).forEach((vectorObject) => {
-          const stateAtPoint = vectorObjectPaintStateAtPoint(vectorObject, worldX, worldY);
+        candidateIndices.forEach((index) => {
+          const node = scene.nodes[index];
+          const stateAtPoint = vectorObjectPaintStateAtPoint(node.vectorObject, worldX, worldY);
           if (!stateAtPoint.visible && stateAtPoint.color === null) return;
           visible = stateAtPoint.visible;
           color = stateAtPoint.visible ? stateAtPoint.color : null;
@@ -14674,14 +15183,14 @@
       }
 
       function layerHasVectorMatch(layer, rect, containment) {
-        const vectorRects = (layer.vectorObjects || [])
-          .filter((vectorObject) => vectorObject?.compositeMode !== "erase")
-          .map(vectorObjectBoundsRect)
-          .filter(Boolean);
-        if (!vectorRects.length) return false;
+        const scene = ensureLayerVectorScene(layer);
+        if (!scene.paintNodeIndices.length) return false;
+        if (scene.paintedBounds && !rectsIntersect(scene.paintedBounds, rect) && !rectContainsRect(rect, scene.paintedBounds)) {
+          return false;
+        }
         return containment
-          ? vectorRects.some((entry) => rectContainsRect(rect, entry))
-          : vectorRects.some((entry) => rectsIntersect(entry, rect));
+          ? scene.paintNodeIndices.some((index) => rectContainsRect(rect, scene.nodes[index].authoredBounds))
+          : scene.paintNodeIndices.some((index) => rectsIntersect(scene.nodes[index].authoredBounds, rect));
       }
 
       function samplePaintColorAt(worldX, worldY) {
@@ -14694,9 +15203,8 @@
       }
 
       function topPaintedLayerAt(worldX, worldY) {
-        for (const layer of getAllLayers()) {
-          if (!layer.visible) continue;
-          if (findDrawingForLayer(layer.id)?.visible === false) continue;
+        for (const entry of ensureMainContentScene().topEntries) {
+          const layer = entry.layer;
           const vectorColor = sampleVectorColorAt(layer, worldX, worldY);
           if (vectorColor) return layer;
           const cell = cellFromWorld(worldX, worldY);

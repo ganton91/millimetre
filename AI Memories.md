@@ -188,6 +188,43 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - display truth = continuous vector render
   - grid truth = snapping / sizing / measurements / future calculations
 
+### Retained vector scene seam
+
+- Το `layer.vectorObjects` παραμένει το **document/history truth**
+- Το runtime χτίζει πλέον ξεχωριστό retained per-layer vector scene (`layerVectorSceneCache`) με ordered nodes σε world space
+- Κάθε scene node κρατά:
+  - cloned vector object για render/query
+  - authored bounds
+  - expanded bounds για stroke-aware rasterization
+  - chunk span πάνω στο world tile grid
+- Το main-canvas chunk render, τα layer vector bounds και τα basic vector hit/read paths διαβάζουν πλέον από αυτό το retained scene — όχι κατευθείαν από το raw `layer.vectorObjects` array
+- Τα display caches είναι πλέον ρητά ξεχωριστά:
+  - `layerCompositeRenderCache`
+  - `layerChunkRenderCache`
+- Άρα το τωρινό architecture seam είναι:
+  - `document vectorObjects -> retained vector scene -> main content scene list -> dirty-region redraw planner -> raster display cache`
+- Αυτό είναι transitional step προς serious vector renderer. Δεν αλλάζει το grid-snapped vector model και δεν επιτρέπει επιστροφή σε per-cell main rendering.
+
+### Main content scene list + dirty-region redraw planner
+
+- Υπάρχει πλέον explicit `mainContentSceneState` για το main canvas:
+  - `topEntries` για top-first queries / hit order
+  - `paintEntries` για painter-order render
+- Το draw / warmup / top-layer hit path δεν χρειάζεται πια να ξανασυνθέτει ad-hoc layer order από raw loops κάθε φορά
+- Κάθε retained layer scene κρατά και:
+  - `rasterBounds`
+  - `dirtyChunkKeys`
+  - `updateMode: "append" | "rebuild"`
+- Τα vector invalidations σημαδεύουν πλέον world-tile chunk spans, όχι implicit full visible-chunk rebuild από revision mismatch
+- Τα legacy tile edits σημαδεύουν ξεχωριστά per-layer dirty chunk keys στο runtime chunk cache, ώστε το compatibility tile path να μπαίνει στον ίδιο redraw planner χωρίς να ξαναγυρνά το main canvas σε per-cell rendering
+- Append-only vector changes μπορούν να κάνουν incremental chunk delta μόνο στα dirty chunks
+- Replace/rewrite vector changes γυρίζουν deterministically σε chunk rebuild μόνο όπου υπάρχει dirty span
+- Το main canvas content repaint δεν κάνει πια υποχρεωτικά full visible-chunk traversal σε κάθε `contentDirty`:
+  - αν αλλάξει viewport / canvas size / scene structure / layer opacity signature → full redraw
+  - αλλιώς ο planner μαζεύει τα visible dirty chunk keys, τα warmup-ready pending chunk redraws, τα συγχωνεύει σε redraw regions και ξαναζωγραφίζει μόνο αυτά τα regions
+- Αν δεν υπάρχει visible dirty region, το content pass μπορεί να γίνει no-op και να κρατήσει το υπάρχον raster display cache ως έχει
+- Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
+
 ### Basic vector hit model
 
 - `samplePaintColorAt` και `topPaintedLayerAt` διαβάζουν πλέον και από vector objects

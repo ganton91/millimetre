@@ -87,6 +87,13 @@
 
 Αυτό είναι το μακροπρόθεσμο architectural direction για τον view renderer και το data model των layers — δεν είναι immediate task αλλά η βάση για οποιαδήποτε μελλοντική δουλειά γύρω από rotated layers ή smooth output.
 
+### Main Canvas — Retained Scene Migration
+
+~~- Επόμενο cut: από dirty chunk invalidation σε πραγματικό dirty-region redraw planner για το main canvas, ώστε να μη χρειάζεται full visible-chunk traversal σε κάθε content repaint~~
+- Ενοποίηση hit-testing / selection / transform handles πάνω σε scene-node queries αντί για ad-hoc scans στα raw arrays
+- Επόμενο structural cut: προαγωγή του retained scene από layer list σε drawing-aware world scene graph με explicit containers / transforms
+- Επόμενο μεγάλο cut: display backend πιο vector-native από το current Canvas2D replay/chunk pipeline, χωρίς επιστροφή σε per-cell main rendering
+
 ---
 
 ### Πρόβλημα με το τρέχον σύστημα (Push Model)
