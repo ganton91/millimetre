@@ -3158,6 +3158,7 @@
           cellCount: 0,
           vectorObjects: [],
           tileRenderRevision: 0,
+          vectorRenderRevision: 0,
         };
       }
 
@@ -3350,6 +3351,7 @@
         layer.tiles = {};
         layer.vectorObjects = (snapshot.vectorObjects || []).map(restoreVectorObjectFromSnapshot).filter(Boolean);
         layer.tileRenderRevision = 0;
+        layer.vectorRenderRevision = 0;
         (snapshot.tiles || []).forEach((tileSnapshot) => {
           const tile = createTile(layer, tileSnapshot.tileX, tileSnapshot.tileY);
           tile.pixels = new Map(tileSnapshot.pixels || []);
@@ -7454,6 +7456,280 @@
         return cells;
       }
 
+      function collectLayerVectorObjects(layer) {
+        return ((layer?.vectorObjects) || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
+      }
+
+      function bumpLayerVectorRevision(layer) {
+        if (!layer) return;
+        layer.vectorRenderRevision = (layer.vectorRenderRevision || 0) + 1;
+      }
+
+      function applyLayerVectorSnapshot(layer, vectorObjects) {
+        if (!layer) return false;
+        layer.vectorObjects = (vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
+        bumpLayerVectorRevision(layer);
+        return true;
+      }
+
+      function layerVectorBoundsRect(layer) {
+        const vectorRects = (layer?.vectorObjects || [])
+          .map(vectorObjectBoundsRect)
+          .filter(Boolean);
+        if (!vectorRects.length) return null;
+        return vectorRects.reduce((accumulator, rect) => ({
+          left: Math.min(accumulator.left, rect.left),
+          top: Math.min(accumulator.top, rect.top),
+          right: Math.max(accumulator.right, rect.right),
+          bottom: Math.max(accumulator.bottom, rect.bottom),
+        }), {
+          left: vectorRects[0].left,
+          top: vectorRects[0].top,
+          right: vectorRects[0].right,
+          bottom: vectorRects[0].bottom,
+        });
+      }
+
+      function combineWorldRects(a, b) {
+        if (!a) return b ? { ...b } : null;
+        if (!b) return { ...a };
+        return {
+          left: Math.min(a.left, b.left),
+          top: Math.min(a.top, b.top),
+          right: Math.max(a.right, b.right),
+          bottom: Math.max(a.bottom, b.bottom),
+        };
+      }
+
+      function layerWorldBoundsRect(layer) {
+        const cellBounds = layerCellBounds(layer);
+        const cellRect = cellBounds
+          ? {
+              left: cellBounds.minX * CELL_SIZE,
+              top: cellBounds.minY * CELL_SIZE,
+              right: (cellBounds.maxX + 1) * CELL_SIZE,
+              bottom: (cellBounds.maxY + 1) * CELL_SIZE,
+            }
+          : null;
+        return combineWorldRects(cellRect, layerVectorBoundsRect(layer));
+      }
+
+      function collectLayerTransformSnapshot(layer) {
+        return {
+          cells: collectLayerCells(layer),
+          vectorObjects: collectLayerVectorObjects(layer),
+        };
+      }
+
+      function layerTransformSnapshotBounds(snapshot) {
+        const cellRect = snapshot?.cells?.length
+          ? snapshot.cells.reduce(
+              (bounds, cell) => ({
+                left: Math.min(bounds.left, cell.x * CELL_SIZE),
+                top: Math.min(bounds.top, cell.y * CELL_SIZE),
+                right: Math.max(bounds.right, (cell.x + 1) * CELL_SIZE),
+                bottom: Math.max(bounds.bottom, (cell.y + 1) * CELL_SIZE),
+              }),
+              {
+                left: snapshot.cells[0].x * CELL_SIZE,
+                top: snapshot.cells[0].y * CELL_SIZE,
+                right: (snapshot.cells[0].x + 1) * CELL_SIZE,
+                bottom: (snapshot.cells[0].y + 1) * CELL_SIZE,
+              }
+            )
+          : null;
+        const vectorRect = (snapshot?.vectorObjects || [])
+          .map(vectorObjectBoundsRect)
+          .filter(Boolean)
+          .reduce((accumulator, rect) => {
+            if (!accumulator) return { ...rect };
+            return combineWorldRects(accumulator, rect);
+          }, null);
+        return combineWorldRects(cellRect, vectorRect);
+      }
+
+      function rotateWorldPointQuarterTurns(worldX, worldY, centerX, centerY, quarterTurns) {
+        let pointX = worldX;
+        let pointY = worldY;
+        const turns = normalizedQuarterTurns(quarterTurns);
+        for (let index = 0; index < turns; index += 1) {
+          const dx = pointX - centerX;
+          const dy = pointY - centerY;
+          pointX = centerX - dy;
+          pointY = centerY + dx;
+        }
+        return { x: pointX, y: pointY };
+      }
+
+      function mirrorWorldPoint(worldX, worldY, centerX, centerY, axis) {
+        return {
+          x: axis === "horizontal" ? centerX - (worldX - centerX) : worldX,
+          y: axis === "vertical" ? centerY - (worldY - centerY) : worldY,
+        };
+      }
+
+      function translateWorldBounds(bounds, deltaX, deltaY) {
+        if (!bounds) return bounds;
+        return {
+          minX: bounds.minX + deltaX,
+          minY: bounds.minY + deltaY,
+          maxX: bounds.maxX + deltaX,
+          maxY: bounds.maxY + deltaY,
+        };
+      }
+
+      function boundsFromTransformedCorners(bounds, pointTransform) {
+        if (!bounds) return null;
+        const corners = [
+          pointTransform(bounds.minX, bounds.minY),
+          pointTransform(bounds.maxX, bounds.minY),
+          pointTransform(bounds.maxX, bounds.maxY),
+          pointTransform(bounds.minX, bounds.maxY),
+        ];
+        return {
+          minX: Math.min(...corners.map((point) => point.x)),
+          minY: Math.min(...corners.map((point) => point.y)),
+          maxX: Math.max(...corners.map((point) => point.x)),
+          maxY: Math.max(...corners.map((point) => point.y)),
+        };
+      }
+
+      function translateVectorGeometry(geometry, deltaX, deltaY) {
+        if (!geometry || typeof geometry !== "object") return geometry;
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          return {
+            ...geometry,
+            bounds: translateWorldBounds(geometry.bounds, deltaX, deltaY),
+          };
+        }
+        if (geometry.type === "circle") {
+          return {
+            ...geometry,
+            center: {
+              x: geometry.center.x + deltaX,
+              y: geometry.center.y + deltaY,
+            },
+          };
+        }
+        if (geometry.type === "polygon") {
+          return {
+            ...geometry,
+            points: geometry.points.map((point) => ({
+              x: point.x + deltaX,
+              y: point.y + deltaY,
+            })),
+          };
+        }
+        return clonePlainData(geometry);
+      }
+
+      function rotateVectorGeometryQuarterTurns(geometry, quarterTurns, centerX, centerY) {
+        if (!geometry || typeof geometry !== "object") return geometry;
+        const rotatePoint = (x, y) => rotateWorldPointQuarterTurns(x, y, centerX, centerY, quarterTurns);
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          return {
+            ...geometry,
+            bounds: boundsFromTransformedCorners(geometry.bounds, rotatePoint),
+          };
+        }
+        if (geometry.type === "circle") {
+          return {
+            ...geometry,
+            center: rotatePoint(geometry.center.x, geometry.center.y),
+          };
+        }
+        if (geometry.type === "polygon") {
+          return {
+            ...geometry,
+            points: geometry.points.map((point) => rotatePoint(point.x, point.y)),
+          };
+        }
+        return clonePlainData(geometry);
+      }
+
+      function mirrorVectorGeometry(geometry, axis, centerX, centerY) {
+        if (!geometry || typeof geometry !== "object") return geometry;
+        const mirrorPoint = (x, y) => mirrorWorldPoint(x, y, centerX, centerY, axis);
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          return {
+            ...geometry,
+            bounds: boundsFromTransformedCorners(geometry.bounds, mirrorPoint),
+          };
+        }
+        if (geometry.type === "circle") {
+          return {
+            ...geometry,
+            center: mirrorPoint(geometry.center.x, geometry.center.y),
+          };
+        }
+        if (geometry.type === "polygon") {
+          return {
+            ...geometry,
+            points: geometry.points.map((point) => mirrorPoint(point.x, point.y)),
+          };
+        }
+        return clonePlainData(geometry);
+      }
+
+      function translateVectorObject(vectorObject, deltaX, deltaY) {
+        const clone = cloneVectorObjectForSnapshot(vectorObject);
+        if (!clone) return null;
+        if (clone.kind === "brushStroke" && Array.isArray(clone.stamps)) {
+          clone.stamps = clone.stamps.map((stamp) => ({
+            ...stamp,
+            bounds: translateWorldBounds(stamp.bounds, deltaX, deltaY),
+          }));
+        }
+        if (clone.geometry) clone.geometry = translateVectorGeometry(clone.geometry, deltaX, deltaY);
+        return clone;
+      }
+
+      function rotateVectorObjectQuarterTurns(vectorObject, quarterTurns, centerX, centerY) {
+        const clone = cloneVectorObjectForSnapshot(vectorObject);
+        if (!clone) return null;
+        if (clone.kind === "brushStroke" && Array.isArray(clone.stamps)) {
+          clone.stamps = clone.stamps.map((stamp) => ({
+            ...stamp,
+            bounds: boundsFromTransformedCorners(stamp.bounds, (x, y) =>
+              rotateWorldPointQuarterTurns(x, y, centerX, centerY, quarterTurns)
+            ),
+          }));
+          if (normalizedQuarterTurns(quarterTurns) % 2 === 1) {
+            const width = clone.brushWidth;
+            clone.brushWidth = clone.brushHeight;
+            clone.brushHeight = width;
+          }
+        }
+        if (clone.geometry) clone.geometry = rotateVectorGeometryQuarterTurns(clone.geometry, quarterTurns, centerX, centerY);
+        return clone;
+      }
+
+      function mirrorVectorObject(vectorObject, axis, centerX, centerY) {
+        const clone = cloneVectorObjectForSnapshot(vectorObject);
+        if (!clone) return null;
+        if (clone.kind === "brushStroke" && Array.isArray(clone.stamps)) {
+          clone.stamps = clone.stamps.map((stamp) => ({
+            ...stamp,
+            bounds: boundsFromTransformedCorners(stamp.bounds, (x, y) => mirrorWorldPoint(x, y, centerX, centerY, axis)),
+          }));
+        }
+        if (clone.geometry) clone.geometry = mirrorVectorGeometry(clone.geometry, axis, centerX, centerY);
+        return clone;
+      }
+
+      function translateLayerTransformSnapshot(snapshot, deltaCellsX, deltaCellsY) {
+        const deltaWorldX = deltaCellsX * CELL_SIZE;
+        const deltaWorldY = deltaCellsY * CELL_SIZE;
+        return {
+          cells: (snapshot?.cells || []).map((cell) => ({
+            ...cell,
+            x: cell.x + deltaCellsX,
+            y: cell.y + deltaCellsY,
+          })),
+          vectorObjects: (snapshot?.vectorObjects || []).map((vectorObject) => translateVectorObject(vectorObject, deltaWorldX, deltaWorldY)),
+        };
+      }
+
       function layerCellBounds(layer) {
         const cells = collectLayerCells(layer);
         if (!cells.length) return null;
@@ -7480,6 +7756,13 @@
         cells.forEach((cell) => {
           setCellColor(layer, cell.x + deltaX, cell.y + deltaY, cell.color);
         });
+        return true;
+      }
+
+      function applyLayerTransformSnapshot(layer, snapshot) {
+        if (!layer) return false;
+        applyLayerCellSnapshot(layer, snapshot?.cells || [], 0, 0);
+        applyLayerVectorSnapshot(layer, snapshot?.vectorObjects || []);
         return true;
       }
 
@@ -7555,17 +7838,76 @@
         });
       }
 
+      function rotateLayerTransformSnapshot(snapshot, quarterTurns) {
+        const turns = normalizedQuarterTurns(quarterTurns);
+        if (!turns) {
+          return {
+            cells: (snapshot?.cells || []).map((cell) => ({ ...cell })),
+            vectorObjects: (snapshot?.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean),
+          };
+        }
+        const bounds = layerTransformSnapshotBounds(snapshot);
+        if (!bounds) return { cells: [], vectorObjects: [] };
+        const centerX = (bounds.left + bounds.right) / 2;
+        const centerY = (bounds.top + bounds.bottom) / 2;
+        return {
+          cells: (snapshot?.cells || []).map((cell) => {
+            const rotated = rotateWorldPointQuarterTurns((cell.x + 0.5) * CELL_SIZE, (cell.y + 0.5) * CELL_SIZE, centerX, centerY, turns);
+            return {
+              ...cell,
+              x: Math.floor(rotated.x / CELL_SIZE),
+              y: Math.floor(rotated.y / CELL_SIZE),
+            };
+          }),
+          vectorObjects: (snapshot?.vectorObjects || [])
+            .map((vectorObject) => rotateVectorObjectQuarterTurns(vectorObject, turns, centerX, centerY))
+            .filter(Boolean),
+        };
+      }
+
+      function mirrorLayerTransformSnapshot(snapshot, axis) {
+        const bounds = layerTransformSnapshotBounds(snapshot);
+        if (!bounds) {
+          return {
+            cells: (snapshot?.cells || []).map((cell) => ({ ...cell })),
+            vectorObjects: (snapshot?.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean),
+          };
+        }
+        const centerX = (bounds.left + bounds.right) / 2;
+        const centerY = (bounds.top + bounds.bottom) / 2;
+        return {
+          cells: (snapshot?.cells || []).map((cell) => {
+            const mirrored = mirrorWorldPoint((cell.x + 0.5) * CELL_SIZE, (cell.y + 0.5) * CELL_SIZE, centerX, centerY, axis);
+            return {
+              ...cell,
+              x: Math.floor(mirrored.x / CELL_SIZE),
+              y: Math.floor(mirrored.y / CELL_SIZE),
+            };
+          }),
+          vectorObjects: (snapshot?.vectorObjects || [])
+            .map((vectorObject) => mirrorVectorObject(vectorObject, axis, centerX, centerY))
+            .filter(Boolean),
+        };
+      }
+
       function layerFlipAxis(axis, quarterTurns) {
         return normalizedQuarterTurns(quarterTurns) % 2 === 0 ? axis : axis === "horizontal" ? "vertical" : "horizontal";
       }
 
       function layerHandleWorldPositions(layer) {
-        const bounds = layerCellBounds(layer);
+        const worldBounds = layerWorldBoundsRect(layer);
+        if (!worldBounds) return null;
+        const bounds = {
+          minX: Math.floor(worldBounds.left / CELL_SIZE),
+          minY: Math.floor(worldBounds.top / CELL_SIZE),
+          maxX: Math.ceil(worldBounds.right / CELL_SIZE) - 1,
+          maxY: Math.ceil(worldBounds.bottom / CELL_SIZE) - 1,
+        };
         if (!bounds) return null;
-        const minWorldX = bounds.minX * CELL_SIZE;
-        const minWorldY = bounds.minY * CELL_SIZE;
-        const maxWorldX = (bounds.maxX + 1) * CELL_SIZE;
-        const maxWorldY = (bounds.maxY + 1) * CELL_SIZE;
+        const minWorldX = worldBounds.left;
+        const minWorldY = worldBounds.top;
+        const maxWorldX = worldBounds.right;
+        const maxWorldY = worldBounds.bottom;
         const centerX = (minWorldX + maxWorldX) / 2;
         const centerY = (minWorldY + maxWorldY) / 2;
         const rotateOffset = 28 / state.viewport.zoom;
@@ -11485,6 +11827,7 @@
           cache = {
             zoomKey: "",
             tileRenderRevision: -1,
+            vectorRenderRevision: -1,
             chunkCanvases: new Map(),
             chunkIndex: new Map(),
             indexedCount: 0,
@@ -11528,6 +11871,12 @@
 
       function ensureLayerVectorChunkIndex(layer, cache) {
         const vectorCount = (layer.vectorObjects || []).length;
+        if (cache.vectorRenderRevision !== (layer.vectorRenderRevision || 0)) {
+          cache.vectorRenderRevision = layer.vectorRenderRevision || 0;
+          cache.chunkIndex = new Map();
+          cache.indexedCount = 0;
+          clearLayerChunkCanvases(cache);
+        }
         if (vectorCount < cache.indexedCount) {
           cache.chunkIndex = new Map();
           cache.indexedCount = 0;
@@ -11593,6 +11942,7 @@
         entry.vectorCount = (layer.vectorObjects || []).length;
         entry.tileRenderRevision = layer.tileRenderRevision || 0;
         entry.zoomKey = cache.zoomKey;
+        entry.vectorRenderRevision = layer.vectorRenderRevision || 0;
       }
 
       function appendLayerChunkVectorDelta(cache, entry, layer, tileX, tileY) {
@@ -11608,12 +11958,14 @@
           compositeVectorObjectToLayerContext(context, opContext, vectorObject, pixelBounds, projectPoint);
         }
         entry.vectorCount = (layer.vectorObjects || []).length;
+        entry.vectorRenderRevision = layer.vectorRenderRevision || 0;
       }
 
       function drawLayerVisibleChunksToContent(layer, bounds, tileSpan) {
         const cache = ensureLayerChunkCache(layer);
         const nextZoomKey = layerChunkZoomKey();
         const tileRevision = layer.tileRenderRevision || 0;
+        const vectorRevision = layer.vectorRenderRevision || 0;
         cache.zoomKey = nextZoomKey;
         if (cache.tileRenderRevision !== tileRevision) {
           cache.tileRenderRevision = tileRevision;
@@ -11628,12 +11980,20 @@
             const key = tileKey(tileX, tileY);
             let entry = cache.chunkCanvases.get(key);
             if (!entry) {
-              entry = { canvas: null, context: null, vectorCount: -1, tileRenderRevision: -1, zoomKey: "" };
+              entry = {
+                canvas: null,
+                context: null,
+                vectorCount: -1,
+                tileRenderRevision: -1,
+                vectorRenderRevision: -1,
+                zoomKey: "",
+              };
               cache.chunkCanvases.set(key, entry);
             }
             const currentVectorCount = (layer.vectorObjects || []).length;
             const needsRebuild =
               entry.tileRenderRevision !== tileRevision ||
+              entry.vectorRenderRevision !== vectorRevision ||
               entry.vectorCount > currentVectorCount;
             if (needsRebuild) rebuildLayerChunk(cache, entry, layer, tileX, tileY, tileSpan);
             else if (entry.vectorCount < currentVectorCount) {
@@ -11673,6 +12033,7 @@
           const cache = ensureLayerChunkCache(layer);
           const currentVectorCount = (layer.vectorObjects || []).length;
           const tileRevision = layer.tileRenderRevision || 0;
+          const vectorRevision = layer.vectorRenderRevision || 0;
           const zoomKey = layerChunkZoomKey();
           for (let tileY = bounds.minTileY; tileY <= bounds.maxTileY; tileY += 1) {
             for (let tileX = bounds.minTileX; tileX <= bounds.maxTileX; tileX += 1) {
@@ -11682,6 +12043,7 @@
                 entry &&
                 entry.zoomKey === zoomKey &&
                 entry.tileRenderRevision === tileRevision &&
+                entry.vectorRenderRevision === vectorRevision &&
                 entry.vectorCount === currentVectorCount
               ) {
                 continue;
@@ -11705,6 +12067,7 @@
         }
         const tileSpan = TILE_SIZE * CELL_SIZE * state.viewport.zoom;
         let remainingBudget = 2;
+        let changed = false;
         while (remainingBudget > 0 && state.chunkWarmup.queue.length) {
           const task = state.chunkWarmup.queue.shift();
           const layer = task.layer;
@@ -11721,17 +12084,33 @@
           const key = tileKey(task.tileX, task.tileY);
           let entry = cache.chunkCanvases.get(key);
           if (!entry) {
-            entry = { canvas: null, context: null, vectorCount: -1, tileRenderRevision: -1, zoomKey: "" };
+            entry = {
+              canvas: null,
+              context: null,
+              vectorCount: -1,
+              tileRenderRevision: -1,
+              vectorRenderRevision: -1,
+              zoomKey: "",
+            };
             cache.chunkCanvases.set(key, entry);
           }
           const currentVectorCount = (layer.vectorObjects || []).length;
           const needsRebuild =
             entry.zoomKey !== cache.zoomKey ||
             entry.tileRenderRevision !== tileRevision ||
+            entry.vectorRenderRevision !== (layer.vectorRenderRevision || 0) ||
             entry.vectorCount > currentVectorCount;
-          if (needsRebuild) rebuildLayerChunk(cache, entry, layer, task.tileX, task.tileY, tileSpan);
-          else if (entry.vectorCount < currentVectorCount) appendLayerChunkVectorDelta(cache, entry, layer, task.tileX, task.tileY);
+          if (needsRebuild) {
+            rebuildLayerChunk(cache, entry, layer, task.tileX, task.tileY, tileSpan);
+            changed = true;
+          } else if (entry.vectorCount < currentVectorCount) {
+            appendLayerChunkVectorDelta(cache, entry, layer, task.tileX, task.tileY);
+            changed = true;
+          }
           remainingBudget -= 1;
+        }
+        if (changed) {
+          render({ content: true });
         }
         if (state.chunkWarmup.queue.length) {
           state.chunkWarmup.frame = window.requestAnimationFrame(processChunkWarmupFrame);
@@ -11782,6 +12161,24 @@
         contentCtx.restore();
       }
 
+      function isLayerUnderLiveTransform(layerId) {
+        return (
+          !!state.interaction &&
+          (state.interaction.type === "layer-move" || state.interaction.type === "layer-rotate") &&
+          state.interaction.layerId === layerId
+        );
+      }
+
+      function drawLayerDirectToContent(layer, width, height, bounds, tileSpan) {
+        const layerCtx = ensureLayerCompositeSurface(width, height);
+        drawLayerTilesToContext(layerCtx, layer, bounds, tileSpan);
+        drawLayerVectorObjectsToContext(layerCtx, layer);
+        contentCtx.save();
+        contentCtx.globalAlpha = layer.opacity;
+        contentCtx.drawImage(layerCompositeCanvas, 0, 0);
+        contentCtx.restore();
+      }
+
       function drawContentScene() {
         const width = ui.contentCanvas.clientWidth;
         const height = ui.contentCanvas.clientHeight;
@@ -11793,6 +12190,10 @@
         [...getAllLayers()].reverse().forEach((layer) => {
           if (!layer.visible) return;
           if (findDrawingForLayer(layer.id)?.visible === false) return;
+          if (isLayerUnderLiveTransform(layer.id)) {
+            drawLayerDirectToContent(layer, width, height, bounds, tileSpan);
+            return;
+          }
           drawLayerVisibleChunksToContent(layer, bounds, tileSpan);
         });
       }
@@ -13775,6 +14176,7 @@
       function appendVectorObject(layer, vectorObject) {
         if (!layer || !vectorObject) return false;
         layer.vectorObjects.push(vectorObject);
+        bumpLayerVectorRevision(layer);
         return true;
       }
 
@@ -15088,11 +15490,11 @@
         const hit = layerTransformHit(layer, pointer.worldX, pointer.worldY);
         if (!hit) return false;
         const cell = cellFromWorld(pointer.worldX, pointer.worldY);
-        const snapshot = collectLayerCells(layer);
+        const snapshot = collectLayerTransformSnapshot(layer);
         if (hit.type === "flip-horizontal" || hit.type === "flip-vertical") {
           const requestedAxis = hit.type === "flip-horizontal" ? "horizontal" : "vertical";
           const effectiveAxis = layerFlipAxis(requestedAxis, layer.rotationQuarterTurns || 0);
-          applyLayerCellSnapshot(layer, mirrorLayerSnapshot(snapshot, effectiveAxis), 0, 0);
+          applyLayerTransformSnapshot(layer, mirrorLayerTransformSnapshot(snapshot, effectiveAxis));
           commitHistory(hit.type === "flip-horizontal" ? "Flip Layer Horizontal" : "Flip Layer Vertical");
           setStatus(hit.type === "flip-horizontal" ? "Layer flipped horizontally." : "Layer flipped vertically.");
           render({ content: true, overlay: true });
@@ -15389,7 +15791,7 @@
           }
           state.interaction.deltaX = deltaX;
           state.interaction.deltaY = deltaY;
-          applyLayerCellSnapshot(layer, state.interaction.snapshot, deltaX, deltaY);
+          applyLayerTransformSnapshot(layer, translateLayerTransformSnapshot(state.interaction.snapshot, deltaX, deltaY));
           render({ content: true, overlay: true });
           return;
         }
@@ -15409,7 +15811,7 @@
           }
           state.interaction.quarterTurns = quarterTurns;
           layer.rotationQuarterTurns = normalizedQuarterTurns((state.interaction.startQuarterTurns || 0) + quarterTurns);
-          applyLayerCellSnapshot(layer, rotateLayerSnapshot(state.interaction.snapshot, quarterTurns), 0, 0);
+          applyLayerTransformSnapshot(layer, rotateLayerTransformSnapshot(state.interaction.snapshot, quarterTurns));
           render({ content: true, overlay: true });
           return;
         }

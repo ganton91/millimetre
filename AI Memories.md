@@ -169,6 +169,8 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 
 **Post-zoom warmup rule:** αν το zoom navigation reuse-άρει προσωρινά chunks από προηγούμενο zoom level για ομαλό wheel interaction, πρέπει να υπάρχει lazy background warm-up των visible chunks αφού η κίνηση σταθεροποιηθεί. Στόχος: να μη φορτώνεται το πρώτο `paint/erase` μετά το zoom με το κόστος του πρώτου rebuild.
 
+**Warmup repaint rule:** όταν το background warm-up ξαναχτίζει visible chunks στο νέο zoom level, πρέπει να ζητά και content repaint. Αλλιώς στην οθόνη μένουν stale scaled chunks και εμφανίζονται zoom artifacts/fringes παρότι το cache έχει ήδη διορθωθεί στο background.
+
 
 ### Authoring cutover — νέα actions σε vector-only path
 
@@ -198,6 +200,18 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 - Το `layerMatchesRect` κάνει πλέον και basic vector-aware matching για marquee selection
 
 **Περιορισμός αυτού του σταδίου:** το vector hit model είναι intentionally basic και δεν λύνει ακόμα όλα τα σύνθετα cases (π.χ. πλήρες boolean resolve πάνω από legacy tile content ή ακριβές transform handles για vector-only layers).
+
+### Layer transforms — mixed tile + vector path
+
+- Τα layer transforms δεν πρέπει να βασίζονται μόνο σε `collectLayerCells()` / `applyLayerCellSnapshot()`
+- Το transform truth ενός layer είναι πλέον mixed snapshot:
+  - `cells`
+  - `vectorObjects`
+- `Move`, `Rotate` (quarter turns) και `Flip` πρέπει να εφαρμόζονται και στα `vectorObjects`, όχι μόνο στα legacy tiles
+- Τα layer handles / selection bounds πρέπει να βασίζονται σε combined world bounds από:
+  - legacy cell content
+  - vector object bounds
+- Κατά τη διάρκεια live layer move/rotate interaction, ο active layer μπορεί να ζωγραφίζεται direct στο main content pass αντί να περιμένει chunk-cache reuse, ώστε το drag να μην μπλοκάρεται από cache invalidation
 
 ---
 
