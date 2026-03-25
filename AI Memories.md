@@ -111,6 +111,33 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 
 **Κανόνας μετάβασης:** σε αυτό το στάδιο δεν έχει αλλάξει ακόμα το authoring/render behavior. Η αλλαγή είναι σκόπιμα μόνο στη βάση δεδομένων ώστε `Brush` και `Shape` να μπορούν στο επόμενο βήμα να γράφουν σε κοινό vector container χωρίς νέο schema redesign.
 
+### Πρώτο authoring path πάνω στο νέο model
+
+- Τα `Shape` paint commits γράφουν πλέον **και** σε `layer.vectorObjects`
+- Το shape vector object αποθηκεύει:
+  - `kind: "shape"`
+  - `sourceTool: "shape"`
+  - `shapeType: rect | ellipse | circle | polygon`
+  - `geometry` σε world units
+  - `style` snapshot από current fill/outline settings
+- Το υπάρχον cell paint path παραμένει ενεργό παράλληλα, άρα:
+  - το σημερινό renderer και τα downstream subsystems συνεχίζουν να δουλεύουν
+  - το vector storage λειτουργεί προς το παρόν ως authoring mirror για το επόμενο στάδιο
+- Στο παρόν βήμα μόνο τα **paint** shapes γίνονται mirror σε vector objects. Το erase behavior δεν έχει μεταφερθεί ακόμα στο vector model.
+
+### Brush mirror πάνω στο νέο model
+
+- Τα ολοκληρωμένα `Brush` paint strokes γράφουν πλέον και σε `layer.vectorObjects`
+- Το brush vector object αποθηκεύει:
+  - `kind: "brushStroke"`
+  - `sourceTool: "brush"`
+  - `brushShape`
+  - `brushWidth` / `brushHeight` σε world units
+  - `style` snapshot από τη στιγμή που ξεκινά το stroke
+  - `stamps[]` με world-space bounds για κάθε sampled brush footprint του stroke
+- Το υπάρχον cell brush painting παραμένει ενεργό παράλληλα
+- Και εδώ, στο παρόν στάδιο, μόνο τα **paint** strokes γίνονται mirror σε vector objects. Το erase δεν έχει περάσει ακόμα στο vector model.
+
 ---
 
 ## Collaboration Rules

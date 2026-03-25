@@ -12992,14 +12992,21 @@
         image.src = previewUrl;
       }
 
-      function brushFootprintBounds(cellX, cellY) {
-        const origin = brushOriginFromCell(cellX, cellY);
+      function brushFootprintBoundsForConfig(cellX, cellY, widthCells, heightCells) {
+        const origin = {
+          x: cellX - Math.floor((widthCells - 1) / 2),
+          y: cellY - Math.floor((heightCells - 1) / 2),
+        };
         return {
           minX: origin.x,
           minY: origin.y,
-          maxX: origin.x + state.brush.width - 1,
-          maxY: origin.y + state.brush.height - 1,
+          maxX: origin.x + widthCells - 1,
+          maxY: origin.y + heightCells - 1,
         };
+      }
+
+      function brushFootprintBounds(cellX, cellY) {
+        return brushFootprintBoundsForConfig(cellX, cellY, state.brush.width, state.brush.height);
       }
 
       function brushPreviewCells(cellX, cellY) {
@@ -13041,6 +13048,63 @@
         }
 
         return changed;
+      }
+
+      function brushLineCells(startCellX, startCellY, endCellX, endCellY) {
+        let x0 = startCellX;
+        let y0 = startCellY;
+        const x1 = endCellX;
+        const y1 = endCellY;
+        const deltaX = Math.abs(x1 - x0);
+        const deltaY = Math.abs(y1 - y0);
+        const stepX = x0 < x1 ? 1 : -1;
+        const stepY = y0 < y1 ? 1 : -1;
+        let error = deltaX - deltaY;
+        const cells = [];
+
+        while (true) {
+          cells.push({ x: x0, y: y0 });
+          if (x0 === x1 && y0 === y1) break;
+          const doubledError = error * 2;
+          if (doubledError > -deltaY) {
+            error -= deltaY;
+            x0 += stepX;
+          }
+          if (doubledError < deltaX) {
+            error += deltaX;
+            y0 += stepY;
+          }
+        }
+
+        return cells;
+      }
+
+      function appendBrushStrokeStamp(interaction, cellX, cellY) {
+        if (!interaction) return;
+        const key = cellX + ":" + cellY;
+        if (!interaction.vectorStampKeys) interaction.vectorStampKeys = new Set();
+        if (interaction.vectorStampKeys.has(key)) return;
+        interaction.vectorStampKeys.add(key);
+        if (!interaction.vectorStampCells) interaction.vectorStampCells = [];
+        interaction.vectorStampCells.push({ x: cellX, y: cellY });
+      }
+
+      function createBrushStrokeVectorObject(interaction) {
+        if (!interaction || interaction.mode !== "paint" || !interaction.vectorStampCells?.length) return null;
+        return {
+          id: generateVectorObjectId(),
+          kind: "brushStroke",
+          sourceTool: "brush",
+          brushShape: interaction.brushShape,
+          brushWidth: interaction.brushWidth * CELL_SIZE,
+          brushHeight: interaction.brushHeight * CELL_SIZE,
+          style: clonePlainData(interaction.vectorStyle || currentVectorStyleSnapshot()),
+          stamps: interaction.vectorStampCells.map((cell) => ({
+            bounds: cellBoundsToWorldBounds(
+              brushFootprintBoundsForConfig(cell.x, cell.y, interaction.brushWidth, interaction.brushHeight)
+            ),
+          })),
+        };
       }
 
       function rememberBrushPoint(cellX, cellY) {
@@ -13132,6 +13196,83 @@
           interaction.currentCellX,
           interaction.currentCellY
         );
+      }
+
+      function cellBoundsToWorldBounds(bounds) {
+        return {
+          minX: bounds.minX * CELL_SIZE,
+          minY: bounds.minY * CELL_SIZE,
+          maxX: (bounds.maxX + 1) * CELL_SIZE,
+          maxY: (bounds.maxY + 1) * CELL_SIZE,
+        };
+      }
+
+      function cellPointToWorldPoint(point) {
+        return {
+          x: (point.x + 0.5) * CELL_SIZE,
+          y: (point.y + 0.5) * CELL_SIZE,
+        };
+      }
+
+      function currentVectorStyleSnapshot() {
+        return {
+          fillColor: state.outline.noFill ? null : state.color.active,
+          outlineColor: state.outline.side ? state.outline.active : null,
+          outlineWidthCells: state.outline.side ? state.outline.width : 0,
+          outlineSide: state.outline.side || null,
+          noFill: !!state.outline.noFill,
+        };
+      }
+
+      function appendVectorObject(layer, vectorObject) {
+        if (!layer || !vectorObject) return false;
+        layer.vectorObjects.push(vectorObject);
+        return true;
+      }
+
+      function createShapeVectorObject(interaction) {
+        if (!interaction || interaction.mode !== "paint") return null;
+        const base = {
+          id: generateVectorObjectId(),
+          kind: "shape",
+          sourceTool: "shape",
+          shapeType: interaction.shapeType,
+          style: currentVectorStyleSnapshot(),
+        };
+        if (interaction.shapeType === "circle") {
+          const spec = circleSpecFromInteraction(interaction);
+          return {
+            ...base,
+            geometry: {
+              type: "circle",
+              center: cellPointToWorldPoint({ x: spec.centerX, y: spec.centerY }),
+              radius: Math.max(CELL_SIZE / 2, spec.radius * CELL_SIZE),
+            },
+          };
+        }
+        const bounds = shapeBoundsFromInteraction(interaction);
+        return {
+          ...base,
+          geometry:
+            interaction.shapeType === "ellipse"
+              ? { type: "ellipse", bounds: cellBoundsToWorldBounds(bounds) }
+              : { type: "rect", bounds: cellBoundsToWorldBounds(bounds) },
+        };
+      }
+
+      function createPolygonVectorObject(points, mode) {
+        if (!Array.isArray(points) || points.length < 3 || mode !== "paint") return null;
+        return {
+          id: generateVectorObjectId(),
+          kind: "shape",
+          sourceTool: "shape",
+          shapeType: "polygon",
+          style: currentVectorStyleSnapshot(),
+          geometry: {
+            type: "polygon",
+            points: points.map(cellPointToWorldPoint),
+          },
+        };
       }
 
       function paintRectShape(bounds, mode) {
@@ -13390,10 +13531,16 @@
       function beginBrush(clientX, clientY, mode, shiftKey) {
         const pointer = worldFromClient(clientX, clientY);
         const cell = cellFromWorld(pointer.worldX, pointer.worldY);
-        if (!activeLayer()) return;
+        const layer = activeLayer();
+        if (!layer) return;
         state.interaction = {
           type: "brush",
+          layerId: layer.id,
           mode,
+          brushShape: state.brush.shape,
+          brushWidth: state.brush.width,
+          brushHeight: state.brush.height,
+          vectorStyle: currentVectorStyleSnapshot(),
           anchorClientX: clientX,
           anchorClientY: clientY,
           anchorCellX: cell.x,
@@ -13401,12 +13548,21 @@
           lockedAxis: null,
           lastKey: "",
           changed: false,
+          vectorStampCells: [],
+          vectorStampKeys: new Set(),
         };
         const shouldDrawLine =
           shiftKey && Number.isInteger(state.brush.lastCellX) && Number.isInteger(state.brush.lastCellY);
         const changed = shouldDrawLine
           ? paintBrushLine(state.brush.lastCellX, state.brush.lastCellY, cell.x, cell.y, mode)
           : paintCells(cell.x, cell.y, mode);
+        if (shouldDrawLine) {
+          brushLineCells(state.brush.lastCellX, state.brush.lastCellY, cell.x, cell.y).forEach((entry) => {
+            appendBrushStrokeStamp(state.interaction, entry.x, entry.y);
+          });
+        } else {
+          appendBrushStrokeStamp(state.interaction, cell.x, cell.y);
+        }
         state.interaction.changed = changed;
         state.interaction.lastKey = cell.x + ":" + cell.y + ":" + mode;
         rememberBrushPoint(cell.x, cell.y);
@@ -13473,13 +13629,26 @@
       }
 
       function commitShapeInteraction(interaction) {
-        if (interaction.shapeType === "circle") return paintCircularShape(interaction, interaction.mode);
-        if (interaction.shapeType === "ellipse") return paintCircleShape(shapeBoundsFromInteraction(interaction), interaction.mode);
-        return paintRectShape(shapeBoundsFromInteraction(interaction), interaction.mode);
+        const layer = activeLayer();
+        if (!layer) return false;
+        const changed =
+          interaction.shapeType === "circle"
+            ? paintCircularShape(interaction, interaction.mode)
+            : interaction.shapeType === "ellipse"
+            ? paintCircleShape(shapeBoundsFromInteraction(interaction), interaction.mode)
+            : paintRectShape(shapeBoundsFromInteraction(interaction), interaction.mode);
+        if (changed) {
+          appendVectorObject(layer, createShapeVectorObject(interaction));
+        }
+        return changed;
       }
 
       function commitPolygonDraft(points, mode) {
+        const layer = activeLayer();
         const changed = paintPolygonShape(points, mode);
+        if (changed && layer) {
+          appendVectorObject(layer, createPolygonVectorObject(points, mode));
+        }
         state.shapeDraft = null;
         state.polygonClickMemory = null;
         if (changed) commitHistory(mode === "erase" ? "Erase Polygon Shape" : "Paint Polygon Shape");
@@ -14399,6 +14568,7 @@
             const changed = paintCells(cell.x, cell.y, state.interaction.mode);
             state.interaction.changed = state.interaction.changed || changed;
             state.interaction.lastKey = key;
+            appendBrushStrokeStamp(state.interaction, cell.x, cell.y);
             rememberBrushPoint(cell.x, cell.y);
             render({ ui: changed, content: true, overlay: true });
           }
@@ -14889,6 +15059,10 @@
           }
         }
         if (state.interaction.type === "brush" && state.interaction.changed) {
+          const layer = getAllLayers().find((entry) => entry.id === state.interaction.layerId);
+          if (layer) {
+            appendVectorObject(layer, createBrushStrokeVectorObject(state.interaction));
+          }
           commitHistory(state.interaction.mode === "erase" ? "Erase Brush Stroke" : "Paint Brush Stroke");
           requestPopoutSync({ layerId: state.interaction.layerId });
         }
