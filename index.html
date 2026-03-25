@@ -3145,7 +3145,32 @@
           rotationQuarterTurns: 0,
           tiles: {},
           cellCount: 0,
+          vectorObjects: [],
         };
+      }
+
+      function generateVectorObjectId() {
+        return "vector-" + Math.random().toString(36).slice(2, 10);
+      }
+
+      function clonePlainData(value) {
+        if (Array.isArray(value)) return value.map(clonePlainData);
+        if (value && typeof value === "object") {
+          return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, clonePlainData(entry)]));
+        }
+        return value;
+      }
+
+      function cloneVectorObjectForSnapshot(vectorObject) {
+        if (!vectorObject || typeof vectorObject !== "object") return null;
+        return clonePlainData(vectorObject);
+      }
+
+      function restoreVectorObjectFromSnapshot(snapshot) {
+        const vectorObject = cloneVectorObjectForSnapshot(snapshot);
+        if (!vectorObject) return null;
+        vectorObject.id = typeof vectorObject.id === "string" ? vectorObject.id : generateVectorObjectId();
+        return vectorObject;
       }
 
       function createDrawing(name) {
@@ -3291,6 +3316,7 @@
           rotationQuarterTurns: layer.rotationQuarterTurns || 0,
           cellCount: layer.cellCount,
           tiles: [],
+          vectorObjects: (layer.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean),
         };
         Object.values(layer.tiles).forEach((tile) => {
           snapshot.tiles.push({
@@ -3310,6 +3336,7 @@
         layer.rotationQuarterTurns = snapshot.rotationQuarterTurns || 0;
         layer.cellCount = snapshot.cellCount || 0;
         layer.tiles = {};
+        layer.vectorObjects = (snapshot.vectorObjects || []).map(restoreVectorObjectFromSnapshot).filter(Boolean);
         (snapshot.tiles || []).forEach((tileSnapshot) => {
           const tile = createTile(layer, tileSnapshot.tileX, tileSnapshot.tileY);
           tile.pixels = new Map(tileSnapshot.pixels || []);
@@ -7280,6 +7307,7 @@
         duplicate.opacity = source.opacity;
         duplicate.rotationQuarterTurns = normalizedQuarterTurns(source.rotationQuarterTurns || 0);
         duplicate.cellCount = source.cellCount;
+        duplicate.vectorObjects = (source.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
         Object.values(source.tiles).forEach((tile) => {
           const nextTile = createTile(duplicate, tile.tileX, tile.tileY);
           nextTile.pixels = new Map(tile.pixels);
@@ -10370,6 +10398,7 @@
               dup.opacity = l.opacity;
               dup.rotationQuarterTurns = l.rotationQuarterTurns || 0;
               dup.cellCount = l.cellCount;
+              dup.vectorObjects = (l.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
               Object.values(l.tiles).forEach((tile) => {
                 const nextTile = createTile(dup, tile.tileX, tile.tileY);
                 nextTile.pixels = new Map(tile.pixels);

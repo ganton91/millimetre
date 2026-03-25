@@ -97,6 +97,22 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 
 ---
 
+## Vector Migration Foundation
+
+Το πρώτο βήμα της μετάβασης από cell-truth σε vector-truth έχει ήδη μπει στο data model:
+
+- Κάθε `layer` έχει πλέον και `vectorObjects: []` εκτός από `tiles`
+- Το `tiles` subsystem παραμένει προσωρινά για backwards compatibility και για staged migration
+- Το νέο `vectorObjects` storage περνάει από:
+  - `createLayer`
+  - history snapshots (`cloneLayerForSnapshot` / `restoreLayerFromSnapshot`)
+  - full project export/import
+  - duplicate layer / duplicate drawing paths
+
+**Κανόνας μετάβασης:** σε αυτό το στάδιο δεν έχει αλλάξει ακόμα το authoring/render behavior. Η αλλαγή είναι σκόπιμα μόνο στη βάση δεδομένων ώστε `Brush` και `Shape` να μπορούν στο επόμενο βήμα να γράφουν σε κοινό vector container χωρίς νέο schema redesign.
+
+---
+
 ## Collaboration Rules
 
 **Pre-Edit Confirmation Rule (ΥΨΗΛΗ ΠΡΟΤΕΡΑΙΟΤΗΤΑ):** Πριν από κάθε αλλαγή αρχείου:
