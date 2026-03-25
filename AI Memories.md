@@ -202,27 +202,51 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - `layerCompositeRenderCache`
   - `layerChunkRenderCache`
 - Άρα το τωρινό architecture seam είναι:
-  - `document vectorObjects -> retained vector scene -> main content scene list -> dirty-region redraw planner -> raster display cache`
+  - `document vectorObjects -> retained vector scene -> drawing-aware world scene graph -> dirty-region redraw planner -> raster display cache`
 - Αυτό είναι transitional step προς serious vector renderer. Δεν αλλάζει το grid-snapped vector model και δεν επιτρέπει επιστροφή σε per-cell main rendering.
 
-### Main content scene list + dirty-region redraw planner
+### Drawing-aware world scene graph + dirty-region redraw planner
 
-- Υπάρχει πλέον explicit `mainContentSceneState` για το main canvas:
+- Υπάρχει πλέον explicit runtime world scene graph (`mainContentSceneState`) για το main canvas:
+  - `drawingNodes` ως retained container nodes
+  - `layerEntries` / `measurementEntries` ως explicit child nodes
+  - `transform` metadata σε κάθε drawing node (`rotation`, `anchor`, current mode = `container-local`)
   - `topEntries` για top-first queries / hit order
   - `paintEntries` για painter-order render
+- `topMeasurementEntries` / `paintMeasurementEntries` για measurement query/draw order πάνω στο ίδιο graph
+- `layerEntriesById` / `measurementEntriesById` λειτουργούν πλέον και ως scene-backed runtime lookup maps:
+  - active layer / measurement resolution
+  - drawing lookup για layer / measurement ownership
+  - βασικά id-based interaction / rename / selection flows
+- Τα core pointer queries του main content περνούν πλέον από shared scene-node helpers:
+  - `canvasSelectionHitAt` για selection priority
+  - `topMeasurementSceneHitAt` / `topPaintedLayerSceneHitAt` για top-first hit order
+  - layer / measurement transform-hit helpers που δέχονται scene entries ή raw entities, αλλά προτιμούν το scene graph όταν είναι fresh
+- Το runtime graph δεν κρατά πια μόνο transform metadata:
+  - κάθε `layer` entry κρατά runtime-local vector scene derived από το retained world vector scene
+  - κάθε `measurement` entry κρατά runtime-local snapshot + local bounds
+  - τα vector render/query paths προβάλλουν local content πίσω σε world/chunk space μέσω του drawing transform
 - Το draw / warmup / top-layer hit path δεν χρειάζεται πια να ξανασυνθέτει ad-hoc layer order από raw loops κάθε φορά
+- Τα βασικά measurement/layer query paths πατάνε πλέον σε graph child entries αντί για raw `getAll…()` + `findDrawingFor…()` scans σε κάθε pass
 - Κάθε retained layer scene κρατά και:
   - `rasterBounds`
   - `dirtyChunkKeys`
   - `updateMode: "append" | "rebuild"`
 - Τα vector invalidations σημαδεύουν πλέον world-tile chunk spans, όχι implicit full visible-chunk rebuild από revision mismatch
 - Τα legacy tile edits σημαδεύουν ξεχωριστά per-layer dirty chunk keys στο runtime chunk cache, ώστε το compatibility tile path να μπαίνει στον ίδιο redraw planner χωρίς να ξαναγυρνά το main canvas σε per-cell rendering
+- Τα legacy tiles παραμένουν ακόμη world-space compatibility content:
+  - δεν έχουν local-space runtime projection όπως τα vectors/measurements
+  - άρα το drawing container-local cut είναι αυτή τη στιγμή strongest στο vector/measurement path, όχι στο legacy tile path
 - Append-only vector changes μπορούν να κάνουν incremental chunk delta μόνο στα dirty chunks
 - Replace/rewrite vector changes γυρίζουν deterministically σε chunk rebuild μόνο όπου υπάρχει dirty span
 - Το main canvas content repaint δεν κάνει πια υποχρεωτικά full visible-chunk traversal σε κάθε `contentDirty`:
   - αν αλλάξει viewport / canvas size / scene structure / layer opacity signature → full redraw
   - αλλιώς ο planner μαζεύει τα visible dirty chunk keys, τα warmup-ready pending chunk redraws, τα συγχωνεύει σε redraw regions και ξαναζωγραφίζει μόνο αυτά τα regions
 - Αν δεν υπάρχει visible dirty region, το content pass μπορεί να γίνει no-op και να κρατήσει το υπάρχον raster display cache ως έχει
+- Το current local-space cut είναι runtime-derived, όχι document-authored:
+  - `layer.vectorObjects` και measurement data παραμένουν document/history truth σε world-authored coordinates
+  - το runtime φτιάχνει local-space retained content από αυτά και μετά το προβάλλει ξανά σε world space
+- Το επόμενο structural cut είναι να περάσει και το document/history model σε drawing-local authored content, και μετά να φτάσει το legacy tile compatibility path στο ίδιο container model
 - Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
 
 ### Basic vector hit model

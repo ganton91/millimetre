@@ -2966,8 +2966,13 @@
       const layerVectorSceneCache = new WeakMap();
       const mainContentSceneState = {
         structureSignature: "",
+        drawingNodes: [],
         topEntries: [],
         paintEntries: [],
+        topMeasurementEntries: [],
+        paintMeasurementEntries: [],
+        layerEntriesById: new Map(),
+        measurementEntriesById: new Map(),
       };
       const mainContentRedrawPlannerState = {
         signature: "",
@@ -4094,8 +4099,64 @@
         return localX + ":" + localY;
       }
 
+      function currentMainContentSceneLookupState() {
+        return mainContentSceneState.structureSignature === currentMainContentSceneStructureSignature() ? mainContentSceneState : null;
+      }
+
+      function sceneLayerEntryById(layerId) {
+        if (!layerId) return null;
+        return currentMainContentSceneLookupState()?.layerEntriesById.get(layerId) || null;
+      }
+
+      function sceneMeasurementEntryById(measurementId) {
+        if (!measurementId) return null;
+        return currentMainContentSceneLookupState()?.measurementEntriesById.get(measurementId) || null;
+      }
+
+      function resolveLayerSceneEntry(layerOrEntry) {
+        if (!layerOrEntry) return null;
+        if (layerOrEntry.kind === "layer" && layerOrEntry.layer) return layerOrEntry;
+        return sceneLayerEntryById(typeof layerOrEntry === "string" ? layerOrEntry : layerOrEntry.id);
+      }
+
+      function resolveMeasurementSceneEntry(measurementOrEntry) {
+        if (!measurementOrEntry) return null;
+        if (measurementOrEntry.kind === "measurement" && measurementOrEntry.measurement) return measurementOrEntry;
+        return sceneMeasurementEntryById(typeof measurementOrEntry === "string" ? measurementOrEntry : measurementOrEntry.id);
+      }
+
+      function findLayerById(layerId) {
+        if (!layerId) return null;
+        const sceneEntry = sceneLayerEntryById(layerId);
+        if (sceneEntry) return sceneEntry.layer;
+        for (const drawing of state.drawings) {
+          const layer = drawing.layers.find((entry) => entry.id === layerId);
+          if (layer) return layer;
+        }
+        return null;
+      }
+
+      function findMeasurementById(measurementId) {
+        if (!measurementId) return null;
+        const sceneEntry = sceneMeasurementEntryById(measurementId);
+        if (sceneEntry) return sceneEntry.measurement;
+        for (const drawing of state.drawings) {
+          const measurement = drawing.measurements.find((entry) => entry.id === measurementId);
+          if (measurement) return measurement;
+        }
+        return null;
+      }
+
+      function activeLayerSceneEntry() {
+        return sceneLayerEntryById(state.activeLayerId);
+      }
+
+      function activeMeasurementSceneEntry() {
+        return sceneMeasurementEntryById(state.activeMeasurementId);
+      }
+
       function activeLayer() {
-        return getAllLayers().find((layer) => layer.id === state.activeLayerId) || null;
+        return findLayerById(state.activeLayerId);
       }
 
       function activeScene() {
@@ -4103,7 +4164,7 @@
       }
 
       function activeMeasurement() {
-        return getAllMeasurements().find((measurement) => measurement.id === state.activeMeasurementId) || null;
+        return findMeasurementById(state.activeMeasurementId);
       }
 
       function getAllLayers() {
@@ -4115,10 +4176,14 @@
       }
 
       function findDrawingForLayer(layerId) {
+        const sceneEntry = sceneLayerEntryById(layerId);
+        if (sceneEntry) return sceneEntry.drawing;
         return state.drawings.find((d) => d.layers.some((l) => l.id === layerId)) || null;
       }
 
       function findDrawingForMeasurement(measurementId) {
+        const sceneEntry = sceneMeasurementEntryById(measurementId);
+        if (sceneEntry) return sceneEntry.drawing;
         return state.drawings.find((d) => d.measurements.some((m) => m.id === measurementId)) || null;
       }
 
@@ -4794,7 +4859,7 @@
         ];
         return orderedLayerIds
           .map((layerId) => {
-            const layer = getAllLayers().find((entry) => entry.id === layerId);
+            const layer = findLayerById(layerId);
             if (!layer) return null;
             const config = defaultViewLayerConfig(view.layerConfigs && view.layerConfigs[layerId]);
             return {
@@ -6752,7 +6817,7 @@
               name: drawing ? drawing.name : "Drawing",
               collapsed: drawingIds.indexOf(drawingId) > 0,
               items: orderedLayerIds.map((layerId) => {
-                const layer = getAllLayers().find((l) => l.id === layerId);
+                const layer = findLayerById(layerId);
                 const config = defaultViewLayerConfig(view.layerConfigs && view.layerConfigs[layerId]);
                 return {
                   layerId,
@@ -7139,7 +7204,7 @@
       }
 
       function setActiveLayerById(layerId, options = {}) {
-        const layer = getAllLayers().find((entry) => entry.id === layerId);
+        const layer = findLayerById(layerId);
         if (!layer) return false;
         cancelSceneCalibration();
         cancelMeasurementDraft();
@@ -7171,7 +7236,7 @@
       }
 
       function setActiveMeasurementById(measurementId, options = {}) {
-        const measurement = getAllMeasurements().find((entry) => entry.id === measurementId);
+        const measurement = findMeasurementById(measurementId);
         if (!measurement) return false;
         const previousMeasurementId = state.activeMeasurementId;
         cancelSceneCalibration();
@@ -7787,6 +7852,367 @@
         }, null);
       }
 
+      function normalizeDrawingTransformAnchor(anchor) {
+        return {
+          x: Number.isFinite(anchor?.x) ? Number(anchor.x) : 0,
+          y: Number.isFinite(anchor?.y) ? Number(anchor.y) : 0,
+        };
+      }
+
+      function drawingRotationRadians(rotation) {
+        return Number.isFinite(Number(rotation)) ? (Number(rotation) * Math.PI) / 180 : 0;
+      }
+
+      function createDrawingWorldTransform(drawing) {
+        const rotation = Number.isFinite(Number(drawing?.rotation)) ? Number(drawing.rotation) : 0;
+        const anchor = normalizeDrawingTransformAnchor(drawing?.anchor);
+        return {
+          rotation,
+          angle: drawingRotationRadians(rotation),
+          anchor,
+          mode: "container-local",
+          signature: [rotation, anchor.x, anchor.y].join("|"),
+        };
+      }
+
+      function drawingWorldPointToLocal(transform, worldX, worldY) {
+        const anchor = transform?.anchor || { x: 0, y: 0 };
+        return rotatePoint(worldX - anchor.x, worldY - anchor.y, -(transform?.angle || 0));
+      }
+
+      function drawingLocalPointToWorld(transform, localX, localY) {
+        const anchor = transform?.anchor || { x: 0, y: 0 };
+        const rotated = rotatePoint(localX, localY, transform?.angle || 0);
+        return {
+          x: anchor.x + rotated.x,
+          y: anchor.y + rotated.y,
+        };
+      }
+
+      function mapWorldRectToDrawingLocalRect(rect, transform) {
+        if (!rect) return null;
+        const corners = [
+          drawingWorldPointToLocal(transform, rect.left, rect.top),
+          drawingWorldPointToLocal(transform, rect.right, rect.top),
+          drawingWorldPointToLocal(transform, rect.right, rect.bottom),
+          drawingWorldPointToLocal(transform, rect.left, rect.bottom),
+        ];
+        return {
+          left: Math.min(...corners.map((point) => point.x)),
+          top: Math.min(...corners.map((point) => point.y)),
+          right: Math.max(...corners.map((point) => point.x)),
+          bottom: Math.max(...corners.map((point) => point.y)),
+        };
+      }
+
+      function mapDrawingLocalRectToWorldRect(rect, transform) {
+        if (!rect) return null;
+        const corners = [
+          drawingLocalPointToWorld(transform, rect.left, rect.top),
+          drawingLocalPointToWorld(transform, rect.right, rect.top),
+          drawingLocalPointToWorld(transform, rect.right, rect.bottom),
+          drawingLocalPointToWorld(transform, rect.left, rect.bottom),
+        ];
+        return {
+          left: Math.min(...corners.map((point) => point.x)),
+          top: Math.min(...corners.map((point) => point.y)),
+          right: Math.max(...corners.map((point) => point.x)),
+          bottom: Math.max(...corners.map((point) => point.y)),
+        };
+      }
+
+      function drawingSceneProjectPoint(transform, baseProjectPoint = worldToScreen) {
+        const projectPoint = (localX, localY) => {
+          const worldPoint = drawingLocalPointToWorld(transform, localX, localY);
+          return baseProjectPoint(worldPoint.x, worldPoint.y);
+        };
+        projectPoint.rotationAngle = transform?.angle || 0;
+        return projectPoint;
+      }
+
+      function drawingChunkProjectPoint(transform, tileX, tileY) {
+        return drawingSceneProjectPoint(transform, chunkProjectPoint(tileX, tileY));
+      }
+
+      function createOrientedRectGeometry(center, width, height, rotation) {
+        return {
+          type: "orientedRect",
+          center,
+          width,
+          height,
+          rotation: normalizeAngle(rotation || 0),
+        };
+      }
+
+      function createOrientedEllipseGeometry(center, radiusX, radiusY, rotation) {
+        return {
+          type: "orientedEllipse",
+          center,
+          radiusX,
+          radiusY,
+          rotation: normalizeAngle(rotation || 0),
+        };
+      }
+
+      function mapVectorGeometryToDrawingLocalRuntime(geometry, transform) {
+        if (!geometry || typeof geometry !== "object") return geometry;
+        const inverseRotation = normalizeAngle(-(transform?.angle || 0));
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          const bounds = geometry.bounds;
+          if (!bounds) return clonePlainData(geometry);
+          const localCenter = drawingWorldPointToLocal(transform, (bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2);
+          const width = bounds.maxX - bounds.minX;
+          const height = bounds.maxY - bounds.minY;
+          return geometry.type === "rect"
+            ? createOrientedRectGeometry(localCenter, width, height, inverseRotation)
+            : createOrientedEllipseGeometry(localCenter, width / 2, height / 2, inverseRotation);
+        }
+        if (geometry.type === "circle") {
+          return {
+            ...geometry,
+            center: drawingWorldPointToLocal(transform, geometry.center.x, geometry.center.y),
+          };
+        }
+        if (geometry.type === "polygon") {
+          return {
+            ...geometry,
+            points: geometry.points.map((point) => drawingWorldPointToLocal(transform, point.x, point.y)),
+          };
+        }
+        return clonePlainData(geometry);
+      }
+
+      function mapVectorObjectToDrawingLocalRuntime(vectorObject, transform) {
+        const clone = cloneVectorObjectForSnapshot(vectorObject);
+        if (!clone) return null;
+        if (clone.kind === "brushStroke" && Array.isArray(clone.stamps)) {
+          clone.stamps = clone.stamps.map((stamp) => {
+            const stampGeometry =
+              stamp?.geometry ||
+              (stamp?.bounds
+                ? {
+                    type: clone.brushShape === "circle" ? "ellipse" : "rect",
+                    bounds: stamp.bounds,
+                  }
+                : null);
+            return stampGeometry
+              ? {
+                  ...stamp,
+                  bounds: undefined,
+                  geometry: mapVectorGeometryToDrawingLocalRuntime(stampGeometry, transform),
+                }
+              : { ...stamp };
+          });
+        }
+        if (clone.geometry) {
+          clone.geometry = mapVectorGeometryToDrawingLocalRuntime(clone.geometry, transform);
+        }
+        return clone;
+      }
+
+      function createDrawingLocalVectorScene(worldScene, transform) {
+        const localScene = createLayerVectorScene();
+        localScene.sourceRevision = worldScene?.sourceRevision || 0;
+        localScene.objectCount = worldScene?.objectCount || 0;
+        localScene.updateMode = worldScene?.updateMode || "steady";
+        localScene.transformSignature = transform?.signature || "";
+        (worldScene?.nodes || []).forEach((worldNode, index) => {
+          const localVectorObject = mapVectorObjectToDrawingLocalRuntime(worldNode.vectorObject, transform);
+          const localNode = createLayerVectorSceneNode(localVectorObject, worldNode.order);
+          if (!localNode) return;
+          localNode.id = worldNode.id;
+          localNode.sourceRef = worldNode.sourceRef;
+          localNode.compositeMode = worldNode.compositeMode;
+          localNode.worldChunkSpan = worldNode.chunkSpan ? { ...worldNode.chunkSpan } : null;
+          localScene.nodes.push(localNode);
+          localScene.authoredBounds = combineWorldRects(localScene.authoredBounds, localNode.authoredBounds);
+          localScene.rasterBounds = combineWorldRects(localScene.rasterBounds, localNode.expandedBounds || localNode.authoredBounds);
+          if (localNode.compositeMode !== "erase") {
+            localScene.paintNodeIndices.push(index);
+            localScene.paintedBounds = combineWorldRects(localScene.paintedBounds, localNode.authoredBounds);
+          }
+        });
+        return localScene;
+      }
+
+      function createDrawingLocalMeasurementPoint(point, transform) {
+        const worldPoint = measurementPointWorld(point);
+        const localPoint = drawingWorldPointToLocal(transform, worldPoint.x, worldPoint.y);
+        return {
+          id: point.id,
+          x: localPoint.x,
+          y: localPoint.y,
+          color: point.color,
+          space: "drawing-local",
+        };
+      }
+
+      function createDrawingLocalMeasurementVertex(point, transform) {
+        const localPoint = drawingWorldPointToLocal(transform, point.x, point.y);
+        return {
+          x: localPoint.x,
+          y: localPoint.y,
+          space: "drawing-local",
+        };
+      }
+
+      function createDrawingLocalMeasurementSnapshot(measurement, transform) {
+        if (!measurement) return null;
+        return {
+          points: measurement.points.map((point) => createDrawingLocalMeasurementPoint(point, transform)),
+          lengths: measurement.lengths.map((length) => ({
+            ...length,
+            start: createDrawingLocalMeasurementVertex(length.start, transform),
+            end: createDrawingLocalMeasurementVertex(length.end, transform),
+          })),
+          areas: measurement.areas.map((area) => ({
+            ...area,
+            points: area.points.map((point) => createDrawingLocalMeasurementVertex(point, transform)),
+          })),
+        };
+      }
+
+      function syncLayerSceneRuntimeContent(entry) {
+        const worldScene = ensureLayerVectorScene(entry.layer);
+        entry.vectorScene = worldScene;
+        const runtimeSignature = [worldScene.sourceRevision, entry.transform?.signature || ""].join("|");
+        if (entry.runtimeVectorSceneSignature !== runtimeSignature) {
+          entry.runtimeVectorScene = createDrawingLocalVectorScene(worldScene, entry.transform);
+          entry.runtimeVectorSceneSignature = runtimeSignature;
+        }
+        return entry.runtimeVectorScene || worldScene;
+      }
+
+      function syncMeasurementSceneRuntimeContent(entry) {
+        entry.localSnapshot = createDrawingLocalMeasurementSnapshot(entry.measurement, entry.transform);
+        entry.localBounds = measurementSnapshotBounds(entry.localSnapshot);
+        return entry.localSnapshot;
+      }
+
+      function resolveLayerRuntimeVectorPair(layerOrEntry) {
+        const entry = resolveLayerSceneEntry(layerOrEntry);
+        const layer = entry?.layer || layerOrEntry;
+        const worldScene = ensureLayerVectorScene(layer);
+        if (!entry) {
+          return {
+            entry: null,
+            layer,
+            worldScene,
+            runtimeScene: worldScene,
+            transform: null,
+          };
+        }
+        return {
+          entry,
+          layer,
+          worldScene,
+          runtimeScene: syncLayerSceneRuntimeContent(entry),
+          transform: entry.transform,
+        };
+      }
+
+      function syncDrawingWorldTransform(node) {
+        if (!node?.drawing) return node?.transform || createDrawingWorldTransform(null);
+        node.transform = createDrawingWorldTransform(node.drawing);
+        return node.transform;
+      }
+
+      function createDrawingSceneNode(drawing, order) {
+        return {
+          kind: "drawing",
+          key: drawing.id,
+          order,
+          drawing,
+          drawingId: drawing.id,
+          visible: drawing.visible !== false,
+          transform: createDrawingWorldTransform(drawing),
+          children: [],
+          layerEntries: [],
+          measurementEntries: [],
+        };
+      }
+
+      function createLayerSceneEntry(drawingNode, layer, order) {
+        return {
+          kind: "layer",
+          key: drawingNode.drawingId + ":" + layer.id,
+          order,
+          drawing: drawingNode.drawing,
+          drawingId: drawingNode.drawingId,
+          drawingNode,
+          parent: drawingNode,
+          layer,
+          layerId: layer.id,
+          visible: drawingNode.visible && layer?.visible !== false,
+          transform: drawingNode.transform,
+          vectorScene: ensureLayerVectorScene(layer),
+          runtimeVectorScene: null,
+          runtimeVectorSceneSignature: "",
+        };
+      }
+
+      function createMeasurementSceneEntry(drawingNode, measurement, order) {
+        return {
+          kind: "measurement",
+          key: drawingNode.drawingId + ":" + measurement.id,
+          order,
+          drawing: drawingNode.drawing,
+          drawingId: drawingNode.drawingId,
+          drawingNode,
+          parent: drawingNode,
+          measurement,
+          measurementId: measurement.id,
+          visible: drawingNode.visible && measurement?.visible !== false && measurement.opacity > 0,
+          transform: drawingNode.transform,
+          localSnapshot: null,
+          localBounds: null,
+        };
+      }
+
+      function refreshMainContentSceneLists() {
+        const topEntries = [];
+        const topMeasurementEntries = [];
+        mainContentSceneState.layerEntriesById = new Map();
+        mainContentSceneState.measurementEntriesById = new Map();
+
+        mainContentSceneState.drawingNodes.forEach((drawingNode) => {
+          drawingNode.visible = drawingNode.drawing?.visible !== false;
+          syncDrawingWorldTransform(drawingNode);
+          drawingNode.children = [];
+
+          drawingNode.layerEntries.forEach((entry) => {
+            entry.drawing = drawingNode.drawing;
+            entry.drawingNode = drawingNode;
+            entry.parent = drawingNode;
+            entry.visible = drawingNode.visible && entry.layer?.visible !== false;
+            entry.transform = drawingNode.transform;
+            entry.vectorScene = ensureLayerVectorScene(entry.layer);
+            syncLayerSceneRuntimeContent(entry);
+            drawingNode.children.push(entry);
+            mainContentSceneState.layerEntriesById.set(entry.layerId, entry);
+            if (entry.visible) topEntries.push(entry);
+          });
+
+          drawingNode.measurementEntries.forEach((entry) => {
+            entry.drawing = drawingNode.drawing;
+            entry.drawingNode = drawingNode;
+            entry.parent = drawingNode;
+            entry.visible = drawingNode.visible && entry.measurement?.visible !== false && entry.measurement.opacity > 0;
+            entry.transform = drawingNode.transform;
+            syncMeasurementSceneRuntimeContent(entry);
+            drawingNode.children.push(entry);
+            mainContentSceneState.measurementEntriesById.set(entry.measurementId, entry);
+            if (entry.visible) topMeasurementEntries.push(entry);
+          });
+        });
+
+        mainContentSceneState.topEntries = topEntries;
+        mainContentSceneState.paintEntries = [...topEntries].reverse();
+        mainContentSceneState.topMeasurementEntries = topMeasurementEntries;
+        mainContentSceneState.paintMeasurementEntries = [...topMeasurementEntries].reverse();
+        return mainContentSceneState;
+      }
+
       function currentMainContentSceneStructureSignature() {
         return state.drawings
           .map((drawing) =>
@@ -7794,31 +8220,27 @@
               drawing.id,
               drawing.visible === false ? 0 : 1,
               drawing.layers.map((layer) => [layer.id, layer.visible === false ? 0 : 1].join(":")).join(","),
+              drawing.measurements.map((measurement) => [measurement.id, measurement.visible === false ? 0 : 1].join(":")).join(","),
             ].join("|")
           )
           .join("||");
       }
 
       function rebuildMainContentScene() {
-        const topEntries = [];
-        state.drawings.forEach((drawing) => {
-          if (drawing.visible === false) return;
-          drawing.layers.forEach((layer) => {
-            if (!layer?.visible) return;
-            topEntries.push({
-              key: drawing.id + ":" + layer.id,
-              drawing,
-              drawingId: drawing.id,
-              layer,
-              layerId: layer.id,
-              vectorScene: ensureLayerVectorScene(layer),
-            });
+        const drawingNodes = state.drawings.map((drawing, order) => {
+          const drawingNode = createDrawingSceneNode(drawing, order);
+          drawing.layers.forEach((layer, layerOrder) => {
+            drawingNode.layerEntries.push(createLayerSceneEntry(drawingNode, layer, layerOrder));
           });
+          drawing.measurements.forEach((measurement, measurementOrder) => {
+            drawingNode.measurementEntries.push(createMeasurementSceneEntry(drawingNode, measurement, measurementOrder));
+          });
+          drawingNode.children = [...drawingNode.layerEntries, ...drawingNode.measurementEntries];
+          return drawingNode;
         });
-        mainContentSceneState.topEntries = topEntries;
-        mainContentSceneState.paintEntries = [...topEntries].reverse();
+        mainContentSceneState.drawingNodes = drawingNodes;
         mainContentSceneState.structureSignature = currentMainContentSceneStructureSignature();
-        return mainContentSceneState;
+        return refreshMainContentSceneLists();
       }
 
       function ensureMainContentScene() {
@@ -7826,10 +8248,7 @@
         if (mainContentSceneState.structureSignature !== signature) {
           return rebuildMainContentScene();
         }
-        mainContentSceneState.topEntries.forEach((entry) => {
-          entry.vectorScene = ensureLayerVectorScene(entry.layer);
-        });
-        return mainContentSceneState;
+        return refreshMainContentSceneLists();
       }
 
       function currentMainContentDisplaySignature() {
@@ -8268,6 +8687,8 @@
       }
 
       function layerHandleWorldPositions(layer) {
+        const layerEntry = resolveLayerSceneEntry(layer);
+        layer = layerEntry?.layer || layer;
         const worldBounds = layerWorldBoundsRect(layer);
         if (!worldBounds) return null;
         const bounds = {
@@ -8540,6 +8961,63 @@
       }
 
       function measurementHandleWorldPositions(measurement) {
+        const measurementEntry = resolveMeasurementSceneEntry(measurement);
+        measurement = measurementEntry?.measurement || measurement;
+        if (measurementEntry?.localBounds) {
+          const localBounds = measurementEntry.localBounds;
+          const centerLocalX = (localBounds.left + localBounds.right) / 2;
+          const centerLocalY = (localBounds.top + localBounds.bottom) / 2;
+          const rotateOffset = 28 / state.viewport.zoom;
+          const quarterTurns = normalizedQuarterTurns(measurement.rotationQuarterTurns || 0);
+          let rotateLocalX = centerLocalX;
+          let rotateLocalY = localBounds.top - rotateOffset;
+          let anchorLocalX = centerLocalX;
+          let anchorLocalY = localBounds.top;
+          if (quarterTurns === 1) {
+            rotateLocalX = localBounds.right + rotateOffset;
+            rotateLocalY = centerLocalY;
+            anchorLocalX = localBounds.right;
+            anchorLocalY = centerLocalY;
+          } else if (quarterTurns === 2) {
+            rotateLocalX = centerLocalX;
+            rotateLocalY = localBounds.bottom + rotateOffset;
+            anchorLocalX = centerLocalX;
+            anchorLocalY = localBounds.bottom;
+          } else if (quarterTurns === 3) {
+            rotateLocalX = localBounds.left - rotateOffset;
+            rotateLocalY = centerLocalY;
+            anchorLocalX = localBounds.left;
+            anchorLocalY = centerLocalY;
+          }
+          const normalX = rotateLocalX - anchorLocalX;
+          const normalY = rotateLocalY - anchorLocalY;
+          const normalLength = Math.hypot(normalX, normalY) || 1;
+          const tangentX = -normalY / normalLength;
+          const tangentY = normalX / normalLength;
+          const flipOffset = 18 / state.viewport.zoom;
+          const worldBounds = mapDrawingLocalRectToWorldRect(localBounds, measurementEntry.transform);
+          return {
+            bounds: {
+              minWorldX: worldBounds.left,
+              minWorldY: worldBounds.top,
+              maxWorldX: worldBounds.right,
+              maxWorldY: worldBounds.bottom,
+            },
+            center: drawingLocalPointToWorld(measurementEntry.transform, centerLocalX, centerLocalY),
+            rotateAnchor: drawingLocalPointToWorld(measurementEntry.transform, anchorLocalX, anchorLocalY),
+            rotate: drawingLocalPointToWorld(measurementEntry.transform, rotateLocalX, rotateLocalY),
+            flipHorizontal: drawingLocalPointToWorld(
+              measurementEntry.transform,
+              rotateLocalX - tangentX * flipOffset,
+              rotateLocalY - tangentY * flipOffset
+            ),
+            flipVertical: drawingLocalPointToWorld(
+              measurementEntry.transform,
+              rotateLocalX + tangentX * flipOffset,
+              rotateLocalY + tangentY * flipOffset
+            ),
+          };
+        }
         const bounds = measurementBounds(measurement);
         if (!bounds) return null;
         const centerX = (bounds.minWorldX + bounds.maxWorldX) / 2;
@@ -8589,6 +9067,8 @@
       }
 
       function measurementTransformHit(measurement, worldX, worldY) {
+        const measurementEntry = resolveMeasurementSceneEntry(measurement);
+        measurement = measurementEntry?.measurement || measurement;
         const handles = measurementHandleWorldPositions(measurement);
         if (!handles) return null;
         const radius = 10 / state.viewport.zoom;
@@ -8613,12 +9093,14 @@
       }
 
       function beginMeasurementTransform(clientX, clientY) {
-        const measurement = activeMeasurement();
+        const measurementEntry = activeMeasurementSceneEntry();
+        const measurement = measurementEntry?.measurement || activeMeasurement();
         if (!measurement) return false;
+        const measurementTarget = measurementEntry || measurement;
         const pointer = worldFromClient(clientX, clientY);
-        const hit = measurementTransformHit(measurement, pointer.worldX, pointer.worldY);
+        const hit = measurementTransformHit(measurementTarget, pointer.worldX, pointer.worldY);
         if (!hit) return false;
-        const itemHit = measurementItemHitAt(measurement, pointer.worldX, pointer.worldY);
+        const itemHit = measurementItemHitAt(measurementTarget, pointer.worldX, pointer.worldY);
         const snapshot = collectMeasurementSnapshot(measurement);
         if (hit.type === "flip-horizontal" || hit.type === "flip-vertical") {
           const requestedAxis = hit.type === "flip-horizontal" ? "horizontal" : "vertical";
@@ -8630,7 +9112,7 @@
           return true;
         }
         if (hit.type === "rotate") {
-          const handles = measurementHandleWorldPositions(measurement);
+          const handles = measurementHandleWorldPositions(measurementTarget);
           if (!handles) return false;
           state.interaction = {
             type: "measurement-rotate",
@@ -8687,11 +9169,13 @@
       }
 
       function beginMeasurementItemTransform(clientX, clientY) {
-        const measurement = activeMeasurement();
+        const measurementEntry = activeMeasurementSceneEntry();
+        const measurement = measurementEntry?.measurement || activeMeasurement();
         const target = state.activeMeasurementItem;
         if (!measurement || !target) return false;
+        const measurementTarget = measurementEntry || measurement;
         const pointer = worldFromClient(clientX, clientY);
-        const hit = measurementItemHitAt(measurement, pointer.worldX, pointer.worldY);
+        const hit = measurementItemHitAt(measurementTarget, pointer.worldX, pointer.worldY);
         if (!measurementItemBelongsToTarget(hit, target)) return false;
         const current = hit || target;
         if (current.kind === "point") {
@@ -8756,7 +9240,7 @@
       }
 
       function beginRenameLayer(layerId) {
-        const layer = getAllLayers().find((entry) => entry.id === layerId);
+        const layer = findLayerById(layerId);
         state.renameSession = layer
           ? {
               kind: "layer",
@@ -8772,13 +9256,13 @@
       function renameEntityBySession(session) {
         if (!session || !session.id) return null;
         if (session.kind === "layer") {
-          return getAllLayers().find((entry) => entry.id === session.id) || null;
+          return findLayerById(session.id);
         }
         if (session.kind === "scene") {
           return state.scenes.find((entry) => entry.id === session.id) || null;
         }
         if (session.kind === "measurement") {
-          return getAllMeasurements().find((entry) => entry.id === session.id) || null;
+          return findMeasurementById(session.id);
         }
         if (session.kind === "view") {
           return state.views.find((entry) => entry.id === session.id) || null;
@@ -8858,7 +9342,7 @@
           return;
         }
         const nextMode = ["points", "length", "area"].includes(state.lastMeasurementMode) ? state.lastMeasurementMode : "points";
-        const measurement = getAllMeasurements().find((entry) => entry.id === measurementId);
+        const measurement = findMeasurementById(measurementId);
         if (measurement) {
           measurement.mode = nextMode;
         }
@@ -8901,7 +9385,7 @@
       }
 
       function beginRenameMeasurement(measurementId) {
-        const measurement = getAllMeasurements().find((entry) => entry.id === measurementId);
+        const measurement = findMeasurementById(measurementId);
         state.renameSession = measurement
           ? {
               kind: "measurement",
@@ -12031,21 +12515,85 @@
         return { shouldFill, shouldStroke };
       }
 
+      function orientedRectCorners(geometry) {
+        if (!geometry?.center) return [];
+        const halfWidth = (geometry.width || 0) / 2;
+        const halfHeight = (geometry.height || 0) / 2;
+        return [
+          rotatePoint(-halfWidth, -halfHeight, geometry.rotation || 0),
+          rotatePoint(halfWidth, -halfHeight, geometry.rotation || 0),
+          rotatePoint(halfWidth, halfHeight, geometry.rotation || 0),
+          rotatePoint(-halfWidth, halfHeight, geometry.rotation || 0),
+        ].map((point) => ({
+          x: geometry.center.x + point.x,
+          y: geometry.center.y + point.y,
+        }));
+      }
+
+      function pointInOrientedRect(geometry, worldX, worldY) {
+        if (!geometry?.center) return false;
+        const local = rotatePoint(worldX - geometry.center.x, worldY - geometry.center.y, -(geometry.rotation || 0));
+        return Math.abs(local.x) <= (geometry.width || 0) / 2 && Math.abs(local.y) <= (geometry.height || 0) / 2;
+      }
+
+      function pointInOrientedEllipse(geometry, worldX, worldY) {
+        if (!geometry?.center) return false;
+        const local = rotatePoint(worldX - geometry.center.x, worldY - geometry.center.y, -(geometry.rotation || 0));
+        const radiusX = Math.max(geometry.radiusX || 0, 1e-6);
+        const radiusY = Math.max(geometry.radiusY || 0, 1e-6);
+        const normalizedX = local.x / radiusX;
+        const normalizedY = local.y / radiusY;
+        return normalizedX * normalizedX + normalizedY * normalizedY <= 1;
+      }
+
       function drawVectorGeometryPath(context, geometry, projectPoint = worldToScreen) {
         if (!geometry || typeof geometry !== "object") return false;
-        if (geometry.type === "rect" || geometry.type === "ellipse") {
+        if (geometry.type === "rect") {
           const bounds = geometry.bounds;
           if (!bounds) return false;
-          const topLeft = projectPoint(bounds.minX, bounds.minY);
-          const width = Math.max(0, (bounds.maxX - bounds.minX) * state.viewport.zoom);
-          const height = Math.max(0, (bounds.maxY - bounds.minY) * state.viewport.zoom);
-          if (geometry.type === "rect") {
-            context.beginPath();
-            context.rect(topLeft.x, topLeft.y, width, height);
-            return true;
-          }
+          const corners = [
+            projectPoint(bounds.minX, bounds.minY),
+            projectPoint(bounds.maxX, bounds.minY),
+            projectPoint(bounds.maxX, bounds.maxY),
+            projectPoint(bounds.minX, bounds.maxY),
+          ];
           context.beginPath();
-          context.ellipse(topLeft.x + width / 2, topLeft.y + height / 2, Math.max(0.5, width / 2), Math.max(0.5, height / 2), 0, 0, Math.PI * 2);
+          context.moveTo(corners[0].x, corners[0].y);
+          corners.slice(1).forEach((point) => context.lineTo(point.x, point.y));
+          context.closePath();
+          return true;
+        }
+        if (geometry.type === "ellipse") {
+          const bounds = geometry.bounds;
+          if (!bounds) return false;
+          const center = projectPoint((bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2);
+          const radiusX = Math.max(0.5, ((bounds.maxX - bounds.minX) * state.viewport.zoom) / 2);
+          const radiusY = Math.max(0.5, ((bounds.maxY - bounds.minY) * state.viewport.zoom) / 2);
+          context.beginPath();
+          context.ellipse(center.x, center.y, radiusX, radiusY, projectPoint.rotationAngle || 0, 0, Math.PI * 2);
+          return true;
+        }
+        if (geometry.type === "orientedRect") {
+          const corners = orientedRectCorners(geometry).map((point) => projectPoint(point.x, point.y));
+          if (!corners.length) return false;
+          context.beginPath();
+          context.moveTo(corners[0].x, corners[0].y);
+          corners.slice(1).forEach((point) => context.lineTo(point.x, point.y));
+          context.closePath();
+          return true;
+        }
+        if (geometry.type === "orientedEllipse") {
+          const center = projectPoint(geometry.center.x, geometry.center.y);
+          context.beginPath();
+          context.ellipse(
+            center.x,
+            center.y,
+            Math.max(0.5, geometry.radiusX * state.viewport.zoom),
+            Math.max(0.5, geometry.radiusY * state.viewport.zoom),
+            normalizeAngle((geometry.rotation || 0) + (projectPoint.rotationAngle || 0)),
+            0,
+            Math.PI * 2
+          );
           return true;
         }
         if (geometry.type === "circle") {
@@ -12090,11 +12638,15 @@
 
         if (vectorObject.kind === "brushStroke" && Array.isArray(vectorObject.stamps)) {
           vectorObject.stamps.forEach((stamp) => {
-            if (!stamp?.bounds) return;
-            const geometry = {
-              type: vectorObject.brushShape === "circle" ? "ellipse" : "rect",
-              bounds: stamp.bounds,
-            };
+            const geometry =
+              stamp?.geometry ||
+              (stamp?.bounds
+                ? {
+                    type: vectorObject.brushShape === "circle" ? "ellipse" : "rect",
+                    bounds: stamp.bounds,
+                  }
+                : null);
+            if (!geometry) return;
             if (!drawVectorGeometryPath(context, geometry, projectPoint)) return;
             if (shouldFill) context.fill();
             if (shouldStroke) context.stroke();
@@ -12129,12 +12681,16 @@
         const rect = vectorObject?.expandedBounds || expandedVectorObjectBoundsRect(vectorObject?.vectorObject || vectorObject);
         if (!rect) return null;
         const paddingPx = 2;
-        const topLeft = projectPoint(rect.left, rect.top);
-        const bottomRight = projectPoint(rect.right, rect.bottom);
-        const minX = Math.max(0, Math.floor(Math.min(topLeft.x, bottomRight.x) * ratio) - paddingPx);
-        const minY = Math.max(0, Math.floor(Math.min(topLeft.y, bottomRight.y) * ratio) - paddingPx);
-        const maxX = Math.min(canvasWidth, Math.ceil(Math.max(topLeft.x, bottomRight.x) * ratio) + paddingPx);
-        const maxY = Math.min(canvasHeight, Math.ceil(Math.max(topLeft.y, bottomRight.y) * ratio) + paddingPx);
+        const corners = [
+          projectPoint(rect.left, rect.top),
+          projectPoint(rect.right, rect.top),
+          projectPoint(rect.right, rect.bottom),
+          projectPoint(rect.left, rect.bottom),
+        ];
+        const minX = Math.max(0, Math.floor(Math.min(...corners.map((point) => point.x)) * ratio) - paddingPx);
+        const minY = Math.max(0, Math.floor(Math.min(...corners.map((point) => point.y)) * ratio) - paddingPx);
+        const maxX = Math.min(canvasWidth, Math.ceil(Math.max(...corners.map((point) => point.x)) * ratio) + paddingPx);
+        const maxY = Math.min(canvasHeight, Math.ceil(Math.max(...corners.map((point) => point.y)) * ratio) + paddingPx);
         const width = Math.max(0, maxX - minX);
         const height = Math.max(0, maxY - minY);
         if (!width || !height) return null;
@@ -12186,14 +12742,16 @@
         );
       }
 
-      function drawLayerVectorObjectsToContext(context, layer, startIndex = 0) {
-        const scene = ensureLayerVectorScene(layer);
+      function drawLayerVectorObjectsToContext(context, layer, startIndex = 0, sceneEntry = null) {
+        const runtime = resolveLayerRuntimeVectorPair(sceneEntry || layer);
+        const scene = runtime.runtimeScene;
+        const projectPoint = runtime.transform ? drawingSceneProjectPoint(runtime.transform) : worldToScreen;
         const opContext = ensureVectorOpSurface(context.canvas.width, context.canvas.height);
         for (let index = startIndex; index < scene.nodes.length; index += 1) {
           const node = scene.nodes[index];
-          const pixelBounds = vectorObjectPixelBounds(node, context.canvas.width, context.canvas.height);
+          const pixelBounds = vectorObjectPixelBounds(node, context.canvas.width, context.canvas.height, projectPoint);
           if (!pixelBounds) continue;
-          compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds);
+          compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds, projectPoint);
         }
       }
 
@@ -12231,10 +12789,10 @@
         cache.chunkCanvases.clear();
       }
 
-      function ensureLayerVectorChunkIndex(layer, cache) {
-        const scene = ensureLayerVectorScene(layer);
-        cache.vectorRenderRevision = scene.sourceRevision;
-        return scene;
+      function ensureLayerVectorChunkRuntime(layer, cache) {
+        const runtime = resolveLayerRuntimeVectorPair(layer);
+        cache.vectorRenderRevision = runtime.worldScene.sourceRevision;
+        return runtime;
       }
 
       function ensureChunkCanvas(entry, size) {
@@ -12258,7 +12816,7 @@
         });
       }
 
-      function rebuildLayerChunk(cache, scene, entry, layer, tileX, tileY, tileSpan) {
+      function rebuildLayerChunk(cache, runtime, entry, layer, tileX, tileY, tileSpan) {
         const context = ensureChunkCanvas(entry, tileSpan);
         context.clearRect(0, 0, entry.canvas.width, entry.canvas.height);
         const tile = layer.tiles[tileKey(tileX, tileY)];
@@ -12266,40 +12824,40 @@
           redrawTile(tile);
           context.drawImage(tile.canvas, 0, 0, entry.canvas.width, entry.canvas.height);
         }
-        const projectPoint = chunkProjectPoint(tileX, tileY);
+        const projectPoint = runtime.transform ? drawingChunkProjectPoint(runtime.transform, tileX, tileY) : chunkProjectPoint(tileX, tileY);
         const opContext = ensureVectorOpSurface(entry.canvas.width, entry.canvas.height);
-        const chunkIndices = scene.chunkIndex.get(tileKey(tileX, tileY)) || [];
+        const chunkIndices = runtime.worldScene.chunkIndex.get(tileKey(tileX, tileY)) || [];
         for (const index of chunkIndices) {
-          const node = scene.nodes[index];
+          const node = runtime.runtimeScene.nodes[index];
           const pixelBounds = vectorObjectPixelBounds(node, entry.canvas.width, entry.canvas.height, projectPoint);
           if (!pixelBounds) continue;
           compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds, projectPoint);
         }
-        entry.vectorCount = scene.nodes.length;
+        entry.vectorCount = runtime.runtimeScene.nodes.length;
         entry.tileRenderRevision = layer.tileRenderRevision || 0;
         entry.zoomKey = cache.zoomKey;
-        entry.vectorRenderRevision = scene.sourceRevision;
+        entry.vectorRenderRevision = runtime.worldScene.sourceRevision;
       }
 
-      function appendLayerChunkVectorDelta(scene, entry, layer, tileX, tileY) {
+      function appendLayerChunkVectorDelta(runtime, entry, layer, tileX, tileY) {
         const context = ensureChunkCanvas(entry, TILE_SIZE * CELL_SIZE * state.viewport.zoom);
-        const projectPoint = chunkProjectPoint(tileX, tileY);
+        const projectPoint = runtime.transform ? drawingChunkProjectPoint(runtime.transform, tileX, tileY) : chunkProjectPoint(tileX, tileY);
         const opContext = ensureVectorOpSurface(entry.canvas.width, entry.canvas.height);
-        const chunkIndices = scene.chunkIndex.get(tileKey(tileX, tileY)) || [];
+        const chunkIndices = runtime.worldScene.chunkIndex.get(tileKey(tileX, tileY)) || [];
         for (const index of chunkIndices) {
           if (index < entry.vectorCount) continue;
-          const node = scene.nodes[index];
+          const node = runtime.runtimeScene.nodes[index];
           const pixelBounds = vectorObjectPixelBounds(node, entry.canvas.width, entry.canvas.height, projectPoint);
           if (!pixelBounds) continue;
           compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds, projectPoint);
         }
-        entry.vectorCount = scene.nodes.length;
-        entry.vectorRenderRevision = scene.sourceRevision;
+        entry.vectorCount = runtime.runtimeScene.nodes.length;
+        entry.vectorRenderRevision = runtime.worldScene.sourceRevision;
       }
 
       function drawLayerVisibleChunksToContent(layer, bounds, tileSpan) {
         const cache = ensureLayerChunkCache(layer);
-        const scene = ensureLayerVectorChunkIndex(layer, cache);
+        const runtime = ensureLayerVectorChunkRuntime(layer, cache);
         const nextZoomKey = layerChunkZoomKey();
         const tileRevision = layer.tileRenderRevision || 0;
         cache.zoomKey = nextZoomKey;
@@ -12323,19 +12881,19 @@
               cache.chunkCanvases.set(key, entry);
             }
             const tileChunkDirty = cache.dirtyTileChunkKeys.has(key);
-            const vectorChunkDirty = scene.dirtyChunkKeys.has(key);
+            const vectorChunkDirty = runtime.worldScene.dirtyChunkKeys.has(key);
             const needsChunkRebuild = !entry.canvas || entry.zoomKey !== cache.zoomKey;
             if (needsChunkRebuild || tileChunkDirty) {
-              rebuildLayerChunk(cache, scene, entry, layer, tileX, tileY, tileSpan);
+              rebuildLayerChunk(cache, runtime, entry, layer, tileX, tileY, tileSpan);
               cache.dirtyTileChunkKeys.delete(key);
-              scene.dirtyChunkKeys.delete(key);
+              runtime.worldScene.dirtyChunkKeys.delete(key);
             } else if (vectorChunkDirty) {
-              if (scene.updateMode !== "append" || entry.vectorCount >= scene.nodes.length) {
-                rebuildLayerChunk(cache, scene, entry, layer, tileX, tileY, tileSpan);
+              if (runtime.worldScene.updateMode !== "append" || entry.vectorCount >= runtime.runtimeScene.nodes.length) {
+                rebuildLayerChunk(cache, runtime, entry, layer, tileX, tileY, tileSpan);
               } else {
-                appendLayerChunkVectorDelta(scene, entry, layer, tileX, tileY);
+                appendLayerChunkVectorDelta(runtime, entry, layer, tileX, tileY);
               }
-              scene.dirtyChunkKeys.delete(key);
+              runtime.worldScene.dirtyChunkKeys.delete(key);
             }
             const screenX = snapPixel(state.viewport.x + tileX * tileSpan);
             const screenY = snapPixel(state.viewport.y + tileY * tileSpan);
@@ -12409,7 +12967,7 @@
           const layer = task.layer;
           const cache = ensureLayerChunkCache(layer);
           cache.zoomKey = layerChunkZoomKey();
-          const scene = ensureLayerVectorChunkIndex(layer, cache);
+          const runtime = ensureLayerVectorChunkRuntime(layer, cache);
           cache.tileRenderRevision = layer.tileRenderRevision || 0;
           const key = tileKey(task.tileX, task.tileY);
           let entry = cache.chunkCanvases.get(key);
@@ -12425,21 +12983,21 @@
             cache.chunkCanvases.set(key, entry);
           }
           const tileChunkDirty = cache.dirtyTileChunkKeys.has(key);
-          const vectorChunkDirty = scene.dirtyChunkKeys.has(key);
+          const vectorChunkDirty = runtime.worldScene.dirtyChunkKeys.has(key);
           const needsRebuild = entry.zoomKey !== cache.zoomKey || !entry.canvas;
           if (needsRebuild || tileChunkDirty) {
-            rebuildLayerChunk(cache, scene, entry, layer, task.tileX, task.tileY, tileSpan);
+            rebuildLayerChunk(cache, runtime, entry, layer, task.tileX, task.tileY, tileSpan);
             cache.dirtyTileChunkKeys.delete(key);
-            scene.dirtyChunkKeys.delete(key);
+            runtime.worldScene.dirtyChunkKeys.delete(key);
             queueMainContentChunkRedraw(task.tileX, task.tileY);
             changed = true;
           } else if (vectorChunkDirty) {
-            if (scene.updateMode === "append" && entry.vectorCount < scene.nodes.length) {
-              appendLayerChunkVectorDelta(scene, entry, layer, task.tileX, task.tileY);
+            if (runtime.worldScene.updateMode === "append" && entry.vectorCount < runtime.runtimeScene.nodes.length) {
+              appendLayerChunkVectorDelta(runtime, entry, layer, task.tileX, task.tileY);
             } else {
-              rebuildLayerChunk(cache, scene, entry, layer, task.tileX, task.tileY, tileSpan);
+              rebuildLayerChunk(cache, runtime, entry, layer, task.tileX, task.tileY, tileSpan);
             }
-            scene.dirtyChunkKeys.delete(key);
+            runtime.worldScene.dirtyChunkKeys.delete(key);
             queueMainContentChunkRedraw(task.tileX, task.tileY);
             changed = true;
           }
@@ -12702,8 +13260,11 @@
         mainContentRedrawPlannerState.forceFull = false;
       }
 
-      function measurementPointWorld(point) {
+      function measurementPointWorld(point, measurementEntry = null) {
         if (typeof point.x === "number" && typeof point.y === "number") {
+          if (point.space === "drawing-local" && measurementEntry?.transform) {
+            return drawingLocalPointToWorld(measurementEntry.transform, point.x, point.y);
+          }
           return {
             x: point.x,
             y: point.y,
@@ -12712,6 +13273,17 @@
         return {
           x: (point.cellX + 0.5) * CELL_SIZE,
           y: (point.cellY + 0.5) * CELL_SIZE,
+        };
+      }
+
+      function measurementVertexWorld(point, measurementEntry = null) {
+        if (!point) return { x: 0, y: 0 };
+        if (point.space === "drawing-local" && measurementEntry?.transform) {
+          return drawingLocalPointToWorld(measurementEntry.transform, point.x, point.y);
+        }
+        return {
+          x: point.x,
+          y: point.y,
         };
       }
 
@@ -13024,8 +13596,36 @@
         return null;
       }
 
+      function canvasSelectionHitAt(clientX, clientY, worldX, worldY) {
+        const view = viewHitAt(clientX, clientY, worldX, worldY);
+        if (view) {
+          return {
+            kind: "view",
+            view,
+          };
+        }
+        const measurementHit = topMeasurementSceneHitAt(worldX, worldY);
+        if (measurementHit) {
+          return {
+            ...measurementHit,
+            itemHit: measurementItemHitAt(measurementHit.entry, worldX, worldY),
+          };
+        }
+        const layerHit = topPaintedLayerSceneHitAt(worldX, worldY);
+        if (layerHit) return layerHit;
+        const scene = topSceneAt(worldX, worldY);
+        if (scene) {
+          return {
+            kind: "scene",
+            scene,
+          };
+        }
+        return null;
+      }
+
       function collectSelectionCandidates(rect, containment) {
         const candidates = [];
+        const sceneState = ensureMainContentScene();
 
         state.views.forEach((view) => {
           if (!viewMatchesRect(view, rect, containment)) return;
@@ -13037,9 +13637,8 @@
           });
         });
 
-        getAllMeasurements().forEach((measurement) => {
-          if (!measurement.visible || measurement.opacity <= 0) return;
-          if (findDrawingForMeasurement(measurement.id)?.visible === false) return;
+        sceneState.topMeasurementEntries.forEach((entry) => {
+          const measurement = entry.measurement;
           if (!measurementMatchesRect(measurement, rect, containment)) return;
           candidates.push({
             kind: "measurement",
@@ -13049,9 +13648,8 @@
           });
         });
 
-        getAllLayers().forEach((layer) => {
-          if (!layer.visible) return;
-          if (findDrawingForLayer(layer.id)?.visible === false) return;
+        sceneState.topEntries.forEach((entry) => {
+          const layer = entry.layer;
           if (!layerMatchesRect(layer, rect, containment)) return;
           candidates.push({
             kind: "layer",
@@ -13199,47 +13797,72 @@
         return changed;
       }
 
-      function measurementHitAt(worldX, worldY) {
-        for (const measurement of getAllMeasurements()) {
-          if (!measurement.visible || measurement.opacity <= 0) continue;
-          if (findDrawingForMeasurement(measurement.id)?.visible === false) continue;
-          const tolerance = CELL_SIZE * 0.12;
+      function measurementEntryContainsPoint(measurement, worldX, worldY) {
+        const measurementEntry = resolveMeasurementSceneEntry(measurement);
+        measurement = measurementEntry?.measurement || measurement;
+        const runtimeMeasurement = measurementEntry?.localSnapshot || measurement;
+        const queryPoint =
+          measurementEntry?.localSnapshot && measurementEntry?.transform
+            ? drawingWorldPointToLocal(measurementEntry.transform, worldX, worldY)
+            : { x: worldX, y: worldY };
+        if (!measurement || !measurement.visible || measurement.opacity <= 0) return false;
+        const tolerance = CELL_SIZE * 0.12;
 
-          const pointHit = measurement.points.some((point) => {
-            const worldPoint = measurementPointWorld(point);
-            return Math.hypot(worldX - worldPoint.x, worldY - worldPoint.y) <= tolerance;
-          });
-          if (pointHit) return measurement;
+        const pointHit = runtimeMeasurement.points.some((point) => {
+          const pointWorld = measurementPointWorld(point);
+          return Math.hypot(queryPoint.x - pointWorld.x, queryPoint.y - pointWorld.y) <= tolerance;
+        });
+        if (pointHit) return true;
 
-          const lengthHit = measurement.lengths.some((length) => {
-            return (
-              distanceToSegment(worldX, worldY, length.start, length.end) <= tolerance ||
-              Math.hypot(worldX - length.start.x, worldY - length.start.y) <= tolerance ||
-              Math.hypot(worldX - length.end.x, worldY - length.end.y) <= tolerance
-            );
-          });
-          if (lengthHit) return measurement;
+        const lengthHit = runtimeMeasurement.lengths.some((length) => {
+          return (
+            distanceToSegment(queryPoint.x, queryPoint.y, length.start, length.end) <= tolerance ||
+            Math.hypot(queryPoint.x - length.start.x, queryPoint.y - length.start.y) <= tolerance ||
+            Math.hypot(queryPoint.x - length.end.x, queryPoint.y - length.end.y) <= tolerance
+          );
+        });
+        if (lengthHit) return true;
 
-          const areaHit = measurement.areas.some((area) => {
-            const hitEdge = area.points.some((point, index) => {
-              const next = area.points[(index + 1) % area.points.length];
-              return distanceToSegment(worldX, worldY, point, next) <= tolerance;
-            });
-            return hitEdge || pointInPolygon(worldX, worldY, area.points);
+        return runtimeMeasurement.areas.some((area) => {
+          const hitEdge = area.points.some((point, index) => {
+            const next = area.points[(index + 1) % area.points.length];
+            return distanceToSegment(queryPoint.x, queryPoint.y, point, next) <= tolerance;
           });
-          if (areaHit) return measurement;
+          return hitEdge || pointInPolygon(queryPoint.x, queryPoint.y, area.points);
+        });
+      }
+
+      function topMeasurementSceneHitAt(worldX, worldY) {
+        for (const entry of ensureMainContentScene().topMeasurementEntries) {
+          if (!measurementEntryContainsPoint(entry, worldX, worldY)) continue;
+          return {
+            kind: "measurement",
+            entry,
+            measurement: entry.measurement,
+          };
         }
         return null;
       }
 
+      function measurementHitAt(worldX, worldY) {
+        return topMeasurementSceneHitAt(worldX, worldY)?.measurement || null;
+      }
+
       function measurementItemHitAt(measurement, worldX, worldY) {
+        const measurementEntry = resolveMeasurementSceneEntry(measurement);
+        measurement = measurementEntry?.measurement || measurement;
+        const runtimeMeasurement = measurementEntry?.localSnapshot || measurement;
+        const queryPoint =
+          measurementEntry?.localSnapshot && measurementEntry?.transform
+            ? drawingWorldPointToLocal(measurementEntry.transform, worldX, worldY)
+            : { x: worldX, y: worldY };
         if (!measurement || !measurement.visible || measurement.opacity <= 0) return null;
         const tolerance = Math.max(CELL_SIZE * 0.12, (measurement.width + 3) / state.viewport.zoom);
         const vertexTolerance = Math.max(tolerance, CELL_SIZE * 0.22, 9 / state.viewport.zoom);
 
-        for (const point of measurement.points) {
-          const worldPoint = measurementPointWorld(point);
-          if (Math.hypot(worldX - worldPoint.x, worldY - worldPoint.y) <= vertexTolerance) {
+        for (const point of runtimeMeasurement.points) {
+          const pointWorld = measurementPointWorld(point);
+          if (Math.hypot(queryPoint.x - pointWorld.x, queryPoint.y - pointWorld.y) <= vertexTolerance) {
             return {
               kind: "point",
               itemId: point.id,
@@ -13248,22 +13871,22 @@
           }
         }
 
-        for (const length of measurement.lengths) {
-          if (Math.hypot(worldX - length.start.x, worldY - length.start.y) <= vertexTolerance) {
+        for (const length of runtimeMeasurement.lengths) {
+          if (Math.hypot(queryPoint.x - length.start.x, queryPoint.y - length.start.y) <= vertexTolerance) {
             return {
               kind: "length",
               itemId: length.id,
               part: "start",
             };
           }
-          if (Math.hypot(worldX - length.end.x, worldY - length.end.y) <= vertexTolerance) {
+          if (Math.hypot(queryPoint.x - length.end.x, queryPoint.y - length.end.y) <= vertexTolerance) {
             return {
               kind: "length",
               itemId: length.id,
               part: "end",
             };
           }
-          if (distanceToSegment(worldX, worldY, length.start, length.end) <= tolerance) {
+          if (distanceToSegment(queryPoint.x, queryPoint.y, length.start, length.end) <= tolerance) {
             return {
               kind: "length",
               itemId: length.id,
@@ -13272,10 +13895,10 @@
           }
         }
 
-        for (const area of measurement.areas) {
+        for (const area of runtimeMeasurement.areas) {
           for (let index = 0; index < area.points.length; index += 1) {
             const point = area.points[index];
-            if (Math.hypot(worldX - point.x, worldY - point.y) <= vertexTolerance) {
+            if (Math.hypot(queryPoint.x - point.x, queryPoint.y - point.y) <= vertexTolerance) {
               return {
                 kind: "area",
                 itemId: area.id,
@@ -13286,9 +13909,9 @@
           }
           const hitEdge = area.points.some((point, index) => {
             const next = area.points[(index + 1) % area.points.length];
-            return distanceToSegment(worldX, worldY, point, next) <= tolerance;
+            return distanceToSegment(queryPoint.x, queryPoint.y, point, next) <= tolerance;
           });
-          if (hitEdge || pointInPolygon(worldX, worldY, area.points)) {
+          if (hitEdge || pointInPolygon(queryPoint.x, queryPoint.y, area.points)) {
             return {
               kind: "area",
               itemId: area.id,
@@ -13297,6 +13920,42 @@
           }
         }
 
+        return null;
+      }
+
+      function layerPaintHitAt(layer, worldX, worldY) {
+        const layerEntry = resolveLayerSceneEntry(layer);
+        layer = layerEntry?.layer || layer;
+        if (!layer || layer.visible === false || layerEntry?.visible === false) return null;
+        const vectorColor = sampleVectorColorAt(layer, worldX, worldY);
+        if (vectorColor) {
+          return {
+            kind: "layer",
+            entry: layerEntry || null,
+            layer,
+            source: "vector",
+            color: vectorColor,
+            cell: null,
+          };
+        }
+        const cell = cellFromWorld(worldX, worldY);
+        const tileColor = getCellColor(layer, cell.x, cell.y);
+        if (!tileColor) return null;
+        return {
+          kind: "layer",
+          entry: layerEntry || null,
+          layer,
+          source: "tile",
+          color: tileColor,
+          cell,
+        };
+      }
+
+      function topPaintedLayerSceneHitAt(worldX, worldY) {
+        for (const entry of ensureMainContentScene().topEntries) {
+          const hit = layerPaintHitAt(entry, worldX, worldY);
+          if (hit) return hit;
+        }
         return null;
       }
 
@@ -13323,29 +13982,32 @@
 
       function activeMeasurementItemData() {
         const measurement = activeMeasurement();
+        const measurementEntry = activeMeasurementSceneEntry();
         const target = state.activeMeasurementItem;
         if (!measurement || !target) return null;
         if (target.kind === "point") {
           const point = measurement.points.find((entry) => entry.id === target.itemId);
           if (!point) return null;
-          return { measurement, target, point };
+          return { measurement, measurementEntry, target, point };
         }
         if (target.kind === "length") {
           const length = measurement.lengths.find((entry) => entry.id === target.itemId);
           if (!length) return null;
-          return { measurement, target, length };
+          return { measurement, measurementEntry, target, length };
         }
         if (target.kind === "area") {
           const area = measurement.areas.find((entry) => entry.id === target.itemId);
           if (!area) return null;
-          return { measurement, target, area };
+          return { measurement, measurementEntry, target, area };
         }
         return null;
       }
 
-      function drawMeasurementLength(context, measurement, length) {
-        const start = worldToScreen(length.start.x, length.start.y);
-        const end = worldToScreen(length.end.x, length.end.y);
+      function drawMeasurementLength(context, measurement, length, measurementEntry = null) {
+        const startWorld = measurementVertexWorld(length.start, measurementEntry);
+        const endWorld = measurementVertexWorld(length.end, measurementEntry);
+        const start = worldToScreen(startWorld.x, startWorld.y);
+        const end = worldToScreen(endWorld.x, endWorld.y);
         const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
         const color = measurementAnnotationColor(length, measurement);
         context.save();
@@ -13367,9 +14029,10 @@
         context.restore();
       }
 
-      function drawMeasurementArea(context, measurement, area) {
-        const screenPoints = area.points.map((point) => worldToScreen(point.x, point.y));
-        const centroidWorld = polygonCentroid(area.points);
+      function drawMeasurementArea(context, measurement, area, measurementEntry = null) {
+        const worldPoints = area.points.map((point) => measurementVertexWorld(point, measurementEntry));
+        const screenPoints = worldPoints.map((point) => worldToScreen(point.x, point.y));
+        const centroidWorld = polygonCentroid(worldPoints);
         const centroid = worldToScreen(centroidWorld.x, centroidWorld.y);
         const color = measurementAnnotationColor(area, measurement);
         context.save();
@@ -13548,14 +14211,13 @@
           }
         }
 
-        getAllMeasurements()
-          .slice()
-          .reverse()
-          .forEach((measurement) => {
-            if (!measurement.visible || measurement.opacity <= 0) return;
-            if (findDrawingForMeasurement(measurement.id)?.visible === false) return;
-            measurement.points.forEach((point) => {
-              const worldPoint = measurementPointWorld(point);
+        ensureMainContentScene()
+          .paintMeasurementEntries
+          .forEach((entry) => {
+            const measurement = entry.measurement;
+            const runtimeMeasurement = entry.localSnapshot || measurement;
+            runtimeMeasurement.points.forEach((point) => {
+              const worldPoint = measurementPointWorld(point, entry);
               const screenPoint = worldToScreen(worldPoint.x, worldPoint.y);
               const radius = 2 + measurement.width * 0.65;
               const color = measurementAnnotationColor(point, measurement);
@@ -13568,8 +14230,8 @@
               overlayCtx.stroke();
               overlayCtx.restore();
             });
-            measurement.lengths.forEach((length) => drawMeasurementLength(overlayCtx, measurement, length));
-            measurement.areas.forEach((area) => drawMeasurementArea(overlayCtx, measurement, area));
+            runtimeMeasurement.lengths.forEach((length) => drawMeasurementLength(overlayCtx, measurement, length, entry));
+            runtimeMeasurement.areas.forEach((area) => drawMeasurementArea(overlayCtx, measurement, area, entry));
           });
 
         const activeMeasurementEntity = !eyedropperActive && state.activeTool === "select" ? activeMeasurement() : null;
@@ -13668,7 +14330,7 @@
         }
 
         if (state.measurementDraft) {
-          const draftMeasurement = getAllMeasurements().find((entry) => entry.id === state.measurementDraft.measurementId);
+          const draftMeasurement = findMeasurementById(state.measurementDraft.measurementId);
           if (draftMeasurement && draftMeasurement.visible && draftMeasurement.opacity > 0) {
             drawMeasurementDraft(overlayCtx, state.measurementDraft, draftMeasurement);
           }
@@ -13790,9 +14452,9 @@
           !(state.interaction && state.interaction.type === "selection-marquee" && state.interaction.moved)
         ) {
           const pointer = worldFromClient(state.pointer.clientX, state.pointer.clientY);
-          const scene = topSceneAt(pointer.worldX, pointer.worldY);
-          if (scene) {
-            const handles = sceneHandleWorldPositions(scene);
+          const selectionHit = canvasSelectionHitAt(state.pointer.clientX, state.pointer.clientY, pointer.worldX, pointer.worldY);
+          if (selectionHit?.kind === "scene") {
+            const handles = sceneHandleWorldPositions(selectionHit.scene);
             const corners = [handles.nw, handles.ne, handles.se, handles.sw].map((corner) => worldToScreen(corner.x, corner.y));
             overlayCtx.save();
             overlayCtx.strokeStyle = getCssVar("--selection");
@@ -13805,22 +14467,17 @@
             overlayCtx.restore();
             return;
           }
-          const layer = topPaintedLayerAt(pointer.worldX, pointer.worldY);
-          if (layer) {
-            const cell = cellFromWorld(pointer.worldX, pointer.worldY);
-              const color = getCellColor(layer, cell.x, cell.y);
-              if (color) {
-                const size = CELL_SIZE * state.viewport.zoom;
-                const x = snapPixel(state.viewport.x + cell.x * size);
-                const y = snapPixel(state.viewport.y + cell.y * size);
-                const snappedSize = Math.max(1, snapPixel(size));
-                overlayCtx.save();
-                overlayCtx.strokeStyle = getCssVar("--selection");
-                overlayCtx.lineWidth = 1;
-                overlayCtx.strokeRect(x + 0.5, y + 0.5, snappedSize - 1, snappedSize - 1);
-                overlayCtx.restore();
-              }
-            }
+          if (selectionHit?.kind === "layer" && selectionHit.source === "tile" && selectionHit.cell) {
+            const size = CELL_SIZE * state.viewport.zoom;
+            const x = snapPixel(state.viewport.x + selectionHit.cell.x * size);
+            const y = snapPixel(state.viewport.y + selectionHit.cell.y * size);
+            const snappedSize = Math.max(1, snapPixel(size));
+            overlayCtx.save();
+            overlayCtx.strokeStyle = getCssVar("--selection");
+            overlayCtx.lineWidth = 1;
+            overlayCtx.strokeRect(x + 0.5, y + 0.5, snappedSize - 1, snappedSize - 1);
+            overlayCtx.restore();
+          }
         }
 
         if (state.pointer.inside && state.activeTool === "brush" && state.color.eyedropper) {
@@ -15034,6 +15691,8 @@
         if (!geometry || typeof geometry !== "object") return false;
         if (geometry.type === "rect") return rectContainsWorldPoint(geometry.bounds, worldX, worldY);
         if (geometry.type === "ellipse") return ellipseContainsWorldPoint(geometry.bounds, worldX, worldY);
+        if (geometry.type === "orientedRect") return pointInOrientedRect(geometry, worldX, worldY);
+        if (geometry.type === "orientedEllipse") return pointInOrientedEllipse(geometry, worldX, worldY);
         if (geometry.type === "circle") return circleContainsWorldPoint(geometry, worldX, worldY);
         if (geometry.type === "polygon") return Array.isArray(geometry.points) && pointInPolygon(worldX, worldY, geometry.points);
         return false;
@@ -15078,6 +15737,28 @@
           };
           return ellipseContainsWorldPoint(outer, worldX, worldY) && !ellipseContainsWorldPoint(inner, worldX, worldY);
         }
+        if (geometry.type === "orientedRect") {
+          const local = rotatePoint(worldX - geometry.center.x, worldY - geometry.center.y, -(geometry.rotation || 0));
+          const halfWidth = (geometry.width || 0) / 2;
+          const halfHeight = (geometry.height || 0) / 2;
+          const outerHalfWidth = halfWidth + (strokeSide === "outside" ? strokeWidth : 0);
+          const outerHalfHeight = halfHeight + (strokeSide === "outside" ? strokeWidth : 0);
+          const innerHalfWidth = Math.max(0, halfWidth - (strokeSide === "inside" ? strokeWidth : 0));
+          const innerHalfHeight = Math.max(0, halfHeight - (strokeSide === "inside" ? strokeWidth : 0));
+          const inOuter = Math.abs(local.x) <= outerHalfWidth && Math.abs(local.y) <= outerHalfHeight;
+          const inInner = Math.abs(local.x) < innerHalfWidth && Math.abs(local.y) < innerHalfHeight;
+          return inOuter && !inInner;
+        }
+        if (geometry.type === "orientedEllipse") {
+          const local = rotatePoint(worldX - geometry.center.x, worldY - geometry.center.y, -(geometry.rotation || 0));
+          const outerRadiusX = (geometry.radiusX || 0) + (strokeSide === "outside" ? strokeWidth : 0);
+          const outerRadiusY = (geometry.radiusY || 0) + (strokeSide === "outside" ? strokeWidth : 0);
+          const innerRadiusX = Math.max(0, (geometry.radiusX || 0) - (strokeSide === "inside" ? strokeWidth : 0));
+          const innerRadiusY = Math.max(0, (geometry.radiusY || 0) - (strokeSide === "inside" ? strokeWidth : 0));
+          const outer = (local.x * local.x) / Math.max(outerRadiusX * outerRadiusX, 1e-6) + (local.y * local.y) / Math.max(outerRadiusY * outerRadiusY, 1e-6);
+          const inner = (local.x * local.x) / Math.max(innerRadiusX * innerRadiusX, 1e-6) + (local.y * local.y) / Math.max(innerRadiusY * innerRadiusY, 1e-6);
+          return outer <= 1 && inner >= 1;
+        }
         if (geometry.type === "circle") {
           const outerRadius = geometry.radius + (strokeSide === "outside" ? strokeWidth : 0);
           const innerRadius = Math.max(0, geometry.radius - (strokeSide === "inside" ? strokeWidth : 0));
@@ -15100,11 +15781,15 @@
           const strokeWidth = vectorOutlineWidthWorld(style);
           for (let index = vectorObject.stamps.length - 1; index >= 0; index -= 1) {
             const stamp = vectorObject.stamps[index];
-            if (!stamp?.bounds) continue;
-            const geometry = {
-              type: vectorObject.brushShape === "circle" ? "ellipse" : "rect",
-              bounds: stamp.bounds,
-            };
+            const geometry =
+              stamp?.geometry ||
+              (stamp?.bounds
+                ? {
+                    type: vectorObject.brushShape === "circle" ? "ellipse" : "rect",
+                    bounds: stamp.bounds,
+                  }
+                : null);
+            if (!geometry) continue;
             const strokeHit = vectorGeometryStrokeContainsPoint(geometry, worldX, worldY, strokeWidth, style.outlineSide);
             const fillHit = !style.noFill && vectorGeometryFillContainsPoint(geometry, worldX, worldY);
             if (!strokeHit && !fillHit) continue;
@@ -15128,14 +15813,15 @@
 
       function sampleVectorColorAt(layer, worldX, worldY) {
         if (!layer) return null;
-        const scene = ensureLayerVectorScene(layer);
-        const candidateIndices = layerVectorScenePointCandidateIndices(scene, worldX, worldY);
+        const runtime = resolveLayerRuntimeVectorPair(layer);
+        const candidateIndices = layerVectorScenePointCandidateIndices(runtime.worldScene, worldX, worldY);
         if (!candidateIndices.length) return null;
+        const samplePoint = runtime.transform ? drawingWorldPointToLocal(runtime.transform, worldX, worldY) : { x: worldX, y: worldY };
         let visible = false;
         let color = null;
         candidateIndices.forEach((index) => {
-          const node = scene.nodes[index];
-          const stateAtPoint = vectorObjectPaintStateAtPoint(node.vectorObject, worldX, worldY);
+          const node = runtime.runtimeScene.nodes[index];
+          const stateAtPoint = vectorObjectPaintStateAtPoint(node.vectorObject, samplePoint.x, samplePoint.y);
           if (!stateAtPoint.visible && stateAtPoint.color === null) return;
           visible = stateAtPoint.visible;
           color = stateAtPoint.visible ? stateAtPoint.color : null;
@@ -15147,7 +15833,7 @@
         if (!vectorObject || typeof vectorObject !== "object") return null;
         if (vectorObject.kind === "brushStroke" && Array.isArray(vectorObject.stamps) && vectorObject.stamps.length) {
           return vectorObject.stamps.reduce((accumulator, stamp) => {
-            const rect = worldRectFromBounds(stamp.bounds);
+            const rect = stamp.geometry ? vectorObjectBoundsRect({ geometry: stamp.geometry }) : worldRectFromBounds(stamp.bounds);
             if (!rect) return accumulator;
             if (!accumulator) return rect;
             return {
@@ -15157,6 +15843,36 @@
               bottom: Math.max(accumulator.bottom, rect.bottom),
             };
           }, null);
+        }
+        if (vectorObject.geometry?.type === "orientedRect") {
+          const corners = orientedRectCorners(vectorObject.geometry);
+          return corners.reduce(
+            (accumulator, point) => ({
+              left: Math.min(accumulator.left, point.x),
+              top: Math.min(accumulator.top, point.y),
+              right: Math.max(accumulator.right, point.x),
+              bottom: Math.max(accumulator.bottom, point.y),
+            }),
+            {
+              left: corners[0].x,
+              top: corners[0].y,
+              right: corners[0].x,
+              bottom: corners[0].y,
+            }
+          );
+        }
+        if (vectorObject.geometry?.type === "orientedEllipse") {
+          const angle = vectorObject.geometry.rotation || 0;
+          const radiusX = vectorObject.geometry.radiusX || 0;
+          const radiusY = vectorObject.geometry.radiusY || 0;
+          const extentX = Math.sqrt(radiusX * radiusX * Math.cos(angle) * Math.cos(angle) + radiusY * radiusY * Math.sin(angle) * Math.sin(angle));
+          const extentY = Math.sqrt(radiusX * radiusX * Math.sin(angle) * Math.sin(angle) + radiusY * radiusY * Math.cos(angle) * Math.cos(angle));
+          return {
+            left: vectorObject.geometry.center.x - extentX,
+            top: vectorObject.geometry.center.y - extentY,
+            right: vectorObject.geometry.center.x + extentX,
+            bottom: vectorObject.geometry.center.y + extentY,
+          };
         }
         if (vectorObject.geometry?.type === "circle") {
           return {
@@ -15183,34 +15899,24 @@
       }
 
       function layerHasVectorMatch(layer, rect, containment) {
-        const scene = ensureLayerVectorScene(layer);
+        const runtime = resolveLayerRuntimeVectorPair(layer);
+        const scene = runtime.runtimeScene;
         if (!scene.paintNodeIndices.length) return false;
-        if (scene.paintedBounds && !rectsIntersect(scene.paintedBounds, rect) && !rectContainsRect(rect, scene.paintedBounds)) {
+        const testRect = runtime.transform ? mapWorldRectToDrawingLocalRect(rect, runtime.transform) : rect;
+        if (scene.paintedBounds && !rectsIntersect(scene.paintedBounds, testRect) && !rectContainsRect(testRect, scene.paintedBounds)) {
           return false;
         }
         return containment
-          ? scene.paintNodeIndices.some((index) => rectContainsRect(rect, scene.nodes[index].authoredBounds))
-          : scene.paintNodeIndices.some((index) => rectsIntersect(scene.nodes[index].authoredBounds, rect));
+          ? scene.paintNodeIndices.some((index) => rectContainsRect(testRect, scene.nodes[index].authoredBounds))
+          : scene.paintNodeIndices.some((index) => rectsIntersect(scene.nodes[index].authoredBounds, testRect));
       }
 
       function samplePaintColorAt(worldX, worldY) {
-        const layer = topPaintedLayerAt(worldX, worldY);
-        if (!layer) return null;
-        const vectorColor = sampleVectorColorAt(layer, worldX, worldY);
-        if (vectorColor) return vectorColor;
-        const cell = cellFromWorld(worldX, worldY);
-        return getCellColor(layer, cell.x, cell.y);
+        return topPaintedLayerSceneHitAt(worldX, worldY)?.color || null;
       }
 
       function topPaintedLayerAt(worldX, worldY) {
-        for (const entry of ensureMainContentScene().topEntries) {
-          const layer = entry.layer;
-          const vectorColor = sampleVectorColorAt(layer, worldX, worldY);
-          if (vectorColor) return layer;
-          const cell = cellFromWorld(worldX, worldY);
-          if (getCellColor(layer, cell.x, cell.y)) return layer;
-        }
-        return null;
+        return topPaintedLayerSceneHitAt(worldX, worldY)?.layer || null;
       }
 
       function beginPan(clientX, clientY) {
@@ -15853,17 +16559,17 @@
       function beginSelection(clientX, clientY) {
         const previousContextSignature = snapshotActiveContextSignature(state);
         const pointer = worldFromClient(clientX, clientY);
-        const view = viewHitAt(clientX, clientY, pointer.worldX, pointer.worldY);
-        if (view) {
-          setActiveViewById(view.id);
+        const hit = canvasSelectionHitAt(clientX, clientY, pointer.worldX, pointer.worldY);
+        if (hit?.kind === "view") {
+          setActiveViewById(hit.view.id);
           pushHistoryContextBaseline(previousContextSignature, "Selection Change");
           setStatus("View active.");
           render({ ui: true, overlay: true });
           return;
         }
-        const measurement = measurementHitAt(pointer.worldX, pointer.worldY);
-        if (measurement) {
-          const itemHit = measurementItemHitAt(measurement, pointer.worldX, pointer.worldY);
+        if (hit?.kind === "measurement") {
+          const measurement = hit.measurement;
+          const itemHit = hit.itemHit;
           const now = Date.now();
           const previousClick = state.measurementSelectClickMemory;
           const isDoubleClick =
@@ -15896,19 +16602,17 @@
           render({ ui: true, overlay: true });
           return;
         }
-        const layer = topPaintedLayerAt(pointer.worldX, pointer.worldY);
-        if (layer) {
-          setActiveLayerById(layer.id, { tool: "select" });
+        if (hit?.kind === "layer") {
+          setActiveLayerById(hit.layer.id, { tool: "select" });
           pushHistoryContextBaseline(previousContextSignature, "Selection Change");
           setStatus("Layer selected.");
           render({ ui: true, overlay: true });
           return;
         }
-        const scene = topSceneAt(pointer.worldX, pointer.worldY);
-        if (scene) {
-          setActiveSceneById(scene.id);
+        if (hit?.kind === "scene") {
+          setActiveSceneById(hit.scene.id);
           pushHistoryContextBaseline(previousContextSignature, "Selection Change");
-          setStatus(scene.locked ? "Locked scene selected." : "Scene selected.");
+          setStatus(hit.scene.locked ? "Locked scene selected." : "Scene selected.");
           render({ ui: true, overlay: true });
           return;
         }
@@ -15992,10 +16696,12 @@
       }
 
       function beginLayerTransform(clientX, clientY) {
-        const layer = activeLayer();
+        const layerEntry = activeLayerSceneEntry();
+        const layer = layerEntry?.layer || activeLayer();
         if (!layer) return false;
+        const layerTarget = layerEntry || layer;
         const pointer = worldFromClient(clientX, clientY);
-        const hit = layerTransformHit(layer, pointer.worldX, pointer.worldY);
+        const hit = layerTransformHit(layerTarget, pointer.worldX, pointer.worldY);
         if (!hit) return false;
         const cell = cellFromWorld(pointer.worldX, pointer.worldY);
         const snapshot = collectLayerTransformSnapshot(layer);
@@ -16009,7 +16715,7 @@
           return true;
         }
         if (hit.type === "rotate") {
-          const handles = layerHandleWorldPositions(layer);
+          const handles = layerHandleWorldPositions(layerTarget);
           if (!handles) return false;
           state.interaction = {
             type: "layer-rotate",
@@ -16191,7 +16897,8 @@
             ui.overlayCanvas.style.cursor = cursorForSceneHit(sceneTransformHit(activeScene(), pointer.worldX, pointer.worldY));
           } else if (state.activeTool === "select" && activeLayer()) {
             const pointer = worldFromClient(event.clientX, event.clientY);
-            const hit = layerTransformHit(activeLayer(), pointer.worldX, pointer.worldY);
+            const layerTarget = activeLayerSceneEntry() || activeLayer();
+            const hit = layerTransformHit(layerTarget, pointer.worldX, pointer.worldY);
             ui.overlayCanvas.style.cursor =
               hit
                 ? hit.type === "rotate"
@@ -16202,11 +16909,12 @@
                 : "default";
           } else if (state.activeTool === "select" && activeMeasurement()) {
             const pointer = worldFromClient(event.clientX, event.clientY);
-            const itemHit = activeMeasurementItemData() ? measurementItemHitAt(activeMeasurement(), pointer.worldX, pointer.worldY) : null;
+            const measurementTarget = activeMeasurementSceneEntry() || activeMeasurement();
+            const itemHit = activeMeasurementItemData() ? measurementItemHitAt(measurementTarget, pointer.worldX, pointer.worldY) : null;
             const hit =
               itemHit && measurementItemBelongsToTarget(itemHit, state.activeMeasurementItem)
                 ? { type: "item-move" }
-                : measurementTransformHit(activeMeasurement(), pointer.worldX, pointer.worldY);
+                : measurementTransformHit(measurementTarget, pointer.worldX, pointer.worldY);
             ui.overlayCanvas.style.cursor =
               hit
                 ? hit.type === "rotate"
@@ -16280,7 +16988,7 @@
 
         if (state.interaction.type === "layer-move") {
           ui.overlayCanvas.style.cursor = "move";
-          const layer = getAllLayers().find((entry) => entry.id === state.interaction.layerId);
+          const layer = findLayerById(state.interaction.layerId);
           if (!layer) return;
           const pointer = worldFromClient(event.clientX, event.clientY);
           const cell = cellFromWorld(pointer.worldX, pointer.worldY);
@@ -16305,7 +17013,7 @@
         }
 
         if (state.interaction.type === "layer-rotate") {
-          const layer = getAllLayers().find((entry) => entry.id === state.interaction.layerId);
+          const layer = findLayerById(state.interaction.layerId);
           if (!layer) return;
           const pointer = worldFromClient(event.clientX, event.clientY);
           const currentAngle = Math.atan2(
@@ -16326,7 +17034,7 @@
 
         if (state.interaction.type === "measurement-move") {
           ui.overlayCanvas.style.cursor = "move";
-          const measurement = getAllMeasurements().find((entry) => entry.id === state.interaction.measurementId);
+          const measurement = findMeasurementById(state.interaction.measurementId);
           if (!measurement) return;
           const pointer = worldFromClient(event.clientX, event.clientY);
           const cell = cellFromWorld(pointer.worldX, pointer.worldY);
@@ -16355,7 +17063,7 @@
 
         if (state.interaction.type === "measurement-item-move") {
           ui.overlayCanvas.style.cursor = "move";
-          const measurement = getAllMeasurements().find((entry) => entry.id === state.interaction.measurementId);
+          const measurement = findMeasurementById(state.interaction.measurementId);
           if (!measurement) return;
           const target = state.interaction.target;
           const pointer = worldFromClient(event.clientX, event.clientY);
@@ -16497,7 +17205,7 @@
         }
 
         if (state.interaction.type === "measurement-rotate") {
-          const measurement = getAllMeasurements().find((entry) => entry.id === state.interaction.measurementId);
+          const measurement = findMeasurementById(state.interaction.measurementId);
           if (!measurement) return;
           const pointer = worldFromClient(event.clientX, event.clientY);
           const currentAngle = Math.atan2(
@@ -16739,7 +17447,7 @@
           return;
         }
         if (state.interaction.type === "measurement-length-drag") {
-          const measurement = getAllMeasurements().find((entry) => entry.id === state.interaction.measurementId);
+          const measurement = findMeasurementById(state.interaction.measurementId);
           if (measurement) {
             if (state.interaction.moved && state.measurementDraft && state.measurementDraft.type === "length-drag") {
               const committed = commitMeasurementLength(measurement, state.measurementDraft.start, state.measurementDraft.end);
@@ -16763,7 +17471,7 @@
         }
         if (state.interaction.type === "brush" && state.interaction.changed) {
           const brushInteraction = state.interaction;
-          const layer = getAllLayers().find((entry) => entry.id === brushInteraction.layerId);
+          const layer = findLayerById(brushInteraction.layerId);
           if (layer) {
             appendVectorObject(layer, createBrushStrokeVectorObject(brushInteraction));
           }
@@ -16856,7 +17564,7 @@
           setStatus("Layer rotated.");
         }
         if (state.interaction.type === "measurement-move") {
-          const measurement = getAllMeasurements().find((entry) => entry.id === state.interaction.measurementId);
+          const measurement = findMeasurementById(state.interaction.measurementId);
           if (!state.interaction.moved && measurement && event) {
             const pointer = worldFromClient(event.clientX, event.clientY);
             const groupHit = measurementTransformHit(measurement, pointer.worldX, pointer.worldY);
