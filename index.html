@@ -12491,7 +12491,9 @@
           return;
         }
 
-        if (state.pointer.inside && state.activeTool === "brush") {
+        if (state.interaction && state.interaction.type === "brush" && state.interaction.vectorStampCells?.length) {
+          drawBrushStrokePreviewOverlay(overlayCtx, state.interaction);
+        } else if (state.pointer.inside && state.activeTool === "brush") {
           const pointer = worldFromClient(state.pointer.clientX, state.pointer.clientY);
           const rawCell = cellFromWorld(pointer.worldX, pointer.worldY);
           const cell =
@@ -13615,6 +13617,36 @@
           ctx.fillRect(x, y, snappedSize, snappedSize);
         });
         ctx.restore();
+      }
+
+      function drawBrushStrokePreviewOverlay(context, interaction) {
+        if (!interaction || interaction.type !== "brush" || !interaction.vectorStampCells?.length) return;
+        const previewColor = interaction.mode === "erase" ? getCssVar("--text") : interaction.vectorStyle?.fillColor || state.color.active;
+        const previewAlpha = interaction.mode === "erase" ? 0.12 : 0.18;
+        const strokeColor = interaction.mode === "erase" ? getCssVar("--text") : interaction.vectorStyle?.outlineColor || previewColor;
+        const strokeAlpha = interaction.mode === "erase" ? 0.34 : 0.56;
+        const size = CELL_SIZE * state.viewport.zoom;
+        context.save();
+        context.fillStyle = hexToRgba(previewColor, previewAlpha);
+        context.strokeStyle = hexToRgba(strokeColor, strokeAlpha);
+        context.lineWidth = 1;
+        interaction.vectorStampCells.forEach((cell) => {
+          const bounds = brushFootprintBoundsForConfig(cell.x, cell.y, interaction.brushWidth, interaction.brushHeight);
+          const x = snapPixel(state.viewport.x + bounds.minX * size);
+          const y = snapPixel(state.viewport.y + bounds.minY * size);
+          const width = Math.max(1, snapPixel((bounds.maxX - bounds.minX + 1) * size));
+          const height = Math.max(1, snapPixel((bounds.maxY - bounds.minY + 1) * size));
+          if (interaction.brushShape === "circle") {
+            context.beginPath();
+            context.ellipse(x + width / 2, y + height / 2, Math.max(0.5, width / 2), Math.max(0.5, height / 2), 0, 0, Math.PI * 2);
+            context.fill();
+            context.stroke();
+          } else {
+            context.fillRect(x, y, width, height);
+            context.strokeRect(x + 0.5, y + 0.5, width - 1, height - 1);
+          }
+        });
+        context.restore();
       }
 
       function worldRectFromBounds(bounds) {
@@ -15388,12 +15420,16 @@
           }
         }
         if (state.interaction.type === "brush" && state.interaction.changed) {
-          const layer = getAllLayers().find((entry) => entry.id === state.interaction.layerId);
+          const brushInteraction = state.interaction;
+          const layer = getAllLayers().find((entry) => entry.id === brushInteraction.layerId);
           if (layer) {
-            appendVectorObject(layer, createBrushStrokeVectorObject(state.interaction));
+            appendVectorObject(layer, createBrushStrokeVectorObject(brushInteraction));
           }
-          commitHistory(state.interaction.mode === "erase" ? "Erase Brush Stroke" : "Paint Brush Stroke");
-          requestPopoutSync({ layerId: state.interaction.layerId });
+          commitHistory(brushInteraction.mode === "erase" ? "Erase Brush Stroke" : "Paint Brush Stroke");
+          requestPopoutSync({ layerId: brushInteraction.layerId });
+          state.interaction = null;
+          render({ ui: true, content: true, overlay: true });
+          return;
         }
         if (state.interaction.type === "viewbox-draw") {
           const draftBounds = normalizeViewBounds(state.interaction.start, state.interaction.current);
