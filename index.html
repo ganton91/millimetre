@@ -2777,7 +2777,12 @@
       const CENTIMETERS_PER_CELL = 5;
       const CELLS_PER_METER = 100 / CENTIMETERS_PER_CELL;
       const CELLS_PER_HALF_METER = 50 / CENTIMETERS_PER_CELL;
+      const WORLD_UNITS_PER_METER = CELL_SIZE * CELLS_PER_METER;
       const VIEW_ELEVATION_STEP_METERS = 0.05;
+      const VIEW_VECTOR_GRID_SUBDIVISIONS = 4;
+      const MAX_VIEW_GRID_UNITS = 2048;
+      const MAX_DERIVED_GEOMETRY_SURFACE_PX = 2048;
+      const DERIVED_GEOMETRY_ALPHA_THRESHOLD = 24;
       const STANDARD_VIEW_DIRECTIONS = ["topToBottom", "bottomToTop", "leftToRight", "rightToLeft", "plan"];
       const DEBUG_VIEW_CELL_GRID = false;
       const DEBUG_VIEW_VECTOR_CONTOURS = false;
@@ -2964,6 +2969,7 @@
       const layerCompositeRenderCache = new WeakMap();
       const layerChunkRenderCache = new WeakMap();
       const layerVectorSceneCache = new WeakMap();
+      const layerDerivedGeometryCache = new WeakMap();
       const mainContentSceneState = {
         structureSignature: "",
         drawingNodes: [],
@@ -4796,6 +4802,17 @@
             return firstColor.value;
           }
         }
+        const derivedGeometry = ensureLayerDerivedGeometry(layer, resolveLayerDocumentTransform(layer));
+        if (derivedGeometry.styleGroups.length) {
+          return derivedGeometry.styleGroups[0].color;
+        }
+        for (let index = (layer.vectorObjects || []).length - 1; index >= 0; index -= 1) {
+          const vectorObject = layer.vectorObjects[index];
+          if (vectorObject?.compositeMode === "erase") continue;
+          const style = vectorObject?.style || {};
+          if (typeof style.fillColor === "string" && !style.noFill) return style.fillColor;
+          if (typeof style.outlineColor === "string") return style.outlineColor;
+        }
         return DEFAULT_COLOR;
       }
 
@@ -4870,8 +4887,39 @@
         };
       }
 
+      function viewBoundsWorldRect(view) {
+        if (!view?.bounds) return null;
+        return {
+          left: view.bounds.minX,
+          top: view.bounds.minY,
+          right: view.bounds.maxX,
+          bottom: view.bounds.maxY,
+        };
+      }
+
+      function intersectWorldRects(a, b) {
+        if (!a || !b) return null;
+        const left = Math.max(a.left, b.left);
+        const top = Math.max(a.top, b.top);
+        const right = Math.min(a.right, b.right);
+        const bottom = Math.min(a.bottom, b.bottom);
+        if (right <= left || bottom <= top) return null;
+        return { left, top, right, bottom };
+      }
+
+      function layerVectorContentBoundsRect(layer) {
+        const derivedGeometry = ensureLayerDerivedGeometry(layer, resolveLayerDocumentTransform(layer));
+        return derivedGeometry.worldBounds ? { ...derivedGeometry.worldBounds } : null;
+      }
+
+      function layerRuntimeContentBoundsRect(layer) {
+        return combineWorldRects(layerTileWorldBoundsRect(layer), layerVectorContentBoundsRect(layer));
+      }
+
       function layerIntersectsView(layer, view) {
         if (!layer || !view || !view.bounds) return false;
+        const vectorRect = intersectWorldRects(layerVectorContentBoundsRect(layer), viewBoundsWorldRect(view));
+        if (vectorRect) return true;
         const bounds = viewCellBounds(view.bounds);
         if (!bounds || bounds.maxX < bounds.minX || bounds.maxY < bounds.minY) return false;
         for (const tile of Object.values(layer.tiles)) {
@@ -5202,7 +5250,7 @@
         return { minX, maxX, minY, maxY, minZ, maxZ };
       }
 
-      function buildDirectionalOcclusionGrid(view, direction, options = {}) {
+      function buildLegacyDirectionalOcclusionGrid(view, direction, options = {}) {
         if (!view) return { error: "no-view" };
         const bounds = viewCellBounds(view.bounds);
         if (!bounds || bounds.maxX < bounds.minX || bounds.maxY < bounds.minY) {
@@ -5306,7 +5354,7 @@
         };
       }
 
-      function buildPlanOcclusionGrid(view, options = {}) {
+      function buildLegacyPlanOcclusionGrid(view, options = {}) {
         if (!view) return { error: "no-view" };
         const bounds = viewCellBounds(view.bounds);
         if (!bounds || bounds.maxX < bounds.minX || bounds.maxY < bounds.minY) {
@@ -5412,6 +5460,439 @@
           planeElevation,
           grid,
         };
+      }
+
+      function viewHasVectorRenderableLayers(configuredLayers) {
+        return configuredLayers.some(({ layer }) => Array.isArray(layer?.vectorObjects) && layer.vectorObjects.length > 0);
+      }
+
+      function buildViewContentExtentsWorld(view, configuredLayers) {
+        const viewRect = viewBoundsWorldRect(view);
+        if (!viewRect) return null;
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
+        let minZ = Infinity;
+        let maxZ = -Infinity;
+        for (const { layer, config } of configuredLayers) {
+          const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
+          if (heightWorld <= 0) continue;
+          const clippedBounds = intersectWorldRects(layerRuntimeContentBoundsRect(layer), viewRect);
+          if (!clippedBounds) continue;
+          minX = Math.min(minX, clippedBounds.left);
+          maxX = Math.max(maxX, clippedBounds.right);
+          minY = Math.min(minY, clippedBounds.top);
+          maxY = Math.max(maxY, clippedBounds.bottom);
+          const baseWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.baseElevation)));
+          const topWorld = baseWorld + heightWorld;
+          minZ = Math.min(minZ, baseWorld);
+          maxZ = Math.max(maxZ, topWorld);
+        }
+        if (!Number.isFinite(minX) || !Number.isFinite(minZ)) return null;
+        return { minX, maxX, minY, maxY, minZ, maxZ };
+      }
+
+      function computeViewGridWorldUnitSize(...spans) {
+        const desired = CELL_SIZE / VIEW_VECTOR_GRID_SUBDIVISIONS;
+        const maxSpan = Math.max(
+          desired,
+          ...spans
+            .filter((value) => Number.isFinite(value))
+            .map((value) => Math.max(0, value))
+        );
+        return Math.max(desired, maxSpan / MAX_VIEW_GRID_UNITS);
+      }
+
+      function gridUnitsForWorldHeight(heightWorld, unitWorldSize) {
+        if (!(heightWorld > 0)) return 0;
+        return Math.max(1, Math.round(heightWorld / unitWorldSize));
+      }
+
+      function derivedHorizontalRunWorldRect(geometry, run) {
+        return {
+          left: geometry.surfaceBounds.left + run.columnStart * geometry.sampleWorldSize,
+          top: geometry.surfaceBounds.top + run.rowIndex * geometry.sampleWorldSize,
+          right: geometry.surfaceBounds.left + run.columnEnd * geometry.sampleWorldSize,
+          bottom: geometry.surfaceBounds.top + (run.rowIndex + 1) * geometry.sampleWorldSize,
+        };
+      }
+
+      function derivedVerticalRunWorldRect(geometry, run) {
+        return {
+          left: geometry.surfaceBounds.left + run.columnIndex * geometry.sampleWorldSize,
+          top: geometry.surfaceBounds.top + run.rowStart * geometry.sampleWorldSize,
+          right: geometry.surfaceBounds.left + (run.columnIndex + 1) * geometry.sampleWorldSize,
+          bottom: geometry.surfaceBounds.top + run.rowEnd * geometry.sampleWorldSize,
+        };
+      }
+
+      function forEachLayerVectorViewRect(layer, orientation, viewRect, callback) {
+        const geometry = ensureLayerDerivedGeometry(layer, resolveLayerDocumentTransform(layer));
+        if (!geometry.worldBounds || !geometry.surfaceBounds) return;
+        const runs = orientation === "vertical" ? geometry.verticalRuns : geometry.horizontalRuns;
+        runs.forEach((run) => {
+          const rect = orientation === "vertical" ? derivedVerticalRunWorldRect(geometry, run) : derivedHorizontalRunWorldRect(geometry, run);
+          const clippedRect = intersectWorldRects(rect, viewRect);
+          if (!clippedRect) return;
+          callback(clippedRect, packedDerivedColorToHex(run.packedColor));
+        });
+      }
+
+      function forEachLayerTileViewRect(layer, viewRect, callback) {
+        for (const tile of Object.values(layer.tiles || {})) {
+          const tileMinX = tile.tileX * TILE_SIZE;
+          const tileMinY = tile.tileY * TILE_SIZE;
+          for (const [key, color] of tile.pixels.entries()) {
+            const [localX, localY] = key.split(":").map(Number);
+            const cellRect = cellWorldRect(tileMinX + localX, tileMinY + localY);
+            const clippedRect = intersectWorldRects(cellRect, viewRect);
+            if (!clippedRect) continue;
+            callback(clippedRect, color);
+          }
+        }
+      }
+
+      function forEachLayerViewRect(layer, orientation, viewRect, callback) {
+        forEachLayerVectorViewRect(layer, orientation, viewRect, callback);
+        forEachLayerTileViewRect(layer, viewRect, callback);
+      }
+
+      function gridUnitsPerMeterForWorldUnitSize(unitWorldSize) {
+        return WORLD_UNITS_PER_METER / unitWorldSize;
+      }
+
+      function directionalFrontBoundaryWorld(viewRect, directionConfig, frontBoundaryOverride) {
+        if (Number.isFinite(frontBoundaryOverride)) return frontBoundaryOverride * CELL_SIZE;
+        if (directionConfig.depthAxis === "y") {
+          return directionConfig.frontBoundary === "min" ? viewRect.top : viewRect.bottom;
+        }
+        return directionConfig.frontBoundary === "min" ? viewRect.left : viewRect.right;
+      }
+
+      function projectCoverageRectToColumns(columns, rect, color, viewPrimaryMinUnits, directionConfig, unitWorldSize, frontBoundaryWorld, hasFrontBoundaryOverride, excludeFromSectionCut) {
+        const primaryMinWorld = directionConfig.primaryAxis === "x" ? rect.left : rect.top;
+        const primaryMaxWorld = directionConfig.primaryAxis === "x" ? rect.right : rect.bottom;
+        const depthMinWorld = directionConfig.depthAxis === "x" ? rect.left : rect.top;
+        const depthMaxWorld = directionConfig.depthAxis === "x" ? rect.right : rect.bottom;
+        if (hasFrontBoundaryOverride) {
+          if (directionConfig.frontBoundary === "min" && depthMaxWorld <= frontBoundaryWorld) return;
+          if (directionConfig.frontBoundary === "max" && depthMinWorld >= frontBoundaryWorld) return;
+        }
+        const columnStart = Math.floor(primaryMinWorld / unitWorldSize) - viewPrimaryMinUnits;
+        const columnEnd = Math.ceil(primaryMaxWorld / unitWorldSize) - 1 - viewPrimaryMinUnits;
+        const depthUnits =
+          directionConfig.frontBoundary === "min"
+            ? Math.floor(depthMinWorld / unitWorldSize)
+            : Math.ceil(depthMaxWorld / unitWorldSize);
+        const isCutGeometry =
+          directionConfig.frontBoundary === "min"
+            ? depthMinWorld <= frontBoundaryWorld && frontBoundaryWorld < depthMaxWorld
+            : depthMinWorld < frontBoundaryWorld && frontBoundaryWorld <= depthMaxWorld;
+        const isCut = !excludeFromSectionCut && isCutGeometry;
+        for (let columnIndex = columnStart; columnIndex <= columnEnd; columnIndex += 1) {
+          if (columnIndex < 0) continue;
+          const existing = columns.get(columnIndex);
+          const isCloser =
+            !existing ||
+            (directionConfig.frontBoundary === "min" ? depthUnits < existing.depth : depthUnits > existing.depth);
+          if (!isCloser) continue;
+          columns.set(columnIndex, {
+            color,
+            depth: depthUnits,
+            isCut,
+            isCutGeometry,
+          });
+        }
+      }
+
+      function applyPlanRectToGrid(grid, rect, originColumnUnits, originRowUnits, unitWorldSize, candidate) {
+        const columnStart = Math.floor(rect.left / unitWorldSize) - originColumnUnits;
+        const columnEnd = Math.ceil(rect.right / unitWorldSize) - 1 - originColumnUnits;
+        const rowStart = Math.floor(rect.top / unitWorldSize) - originRowUnits;
+        const rowEnd = Math.ceil(rect.bottom / unitWorldSize) - 1 - originRowUnits;
+        let changed = false;
+        for (let rowIndex = rowStart; rowIndex <= rowEnd; rowIndex += 1) {
+          if (rowIndex < 0 || rowIndex >= grid.length) continue;
+          for (let columnIndex = columnStart; columnIndex <= columnEnd; columnIndex += 1) {
+            if (columnIndex < 0 || columnIndex >= grid[rowIndex].length) continue;
+            const existing = grid[rowIndex][columnIndex];
+            const isCloser =
+              !existing ||
+              candidate.depth > existing.depth ||
+              (candidate.depth === existing.depth && candidate.orderIndex < existing.orderIndex);
+            if (!isCloser) continue;
+            grid[rowIndex][columnIndex] = { ...candidate };
+            changed = true;
+          }
+        }
+        return changed;
+      }
+
+      function buildVectorDrivenDirectionalOcclusionGrid(view, direction, options = {}, configuredLayers = orderedConfiguredLayersForView(view)) {
+        if (!view) return { error: "no-view" };
+        const viewRect = viewBoundsWorldRect(view);
+        if (!viewRect || viewRect.right <= viewRect.left || viewRect.bottom <= viewRect.top) {
+          return { error: "invalid-bounds" };
+        }
+        if (!configuredLayers.length) return { error: "no-layers" };
+
+        const globalExtents = buildViewContentExtentsWorld(view, configuredLayers);
+        if (!globalExtents) return { error: "no-renderable" };
+
+        const directionConfig = directionalViewConfig(direction);
+        const globalWidthWorld = globalExtents.maxX - globalExtents.minX;
+        const globalHeightWorld = globalExtents.maxY - globalExtents.minY;
+        const zSpanWorld = globalExtents.maxZ - globalExtents.minZ;
+        const unitWorldSize = computeViewGridWorldUnitSize(Math.max(globalWidthWorld, globalHeightWorld), zSpanWorld);
+        const gridUnitsPerMeter = gridUnitsPerMeterForWorldUnitSize(unitWorldSize);
+        const contentMinZUnits = Math.floor(globalExtents.minZ / unitWorldSize);
+        const contentMaxZUnits = Math.ceil(globalExtents.maxZ / unitWorldSize);
+        const totalRows = contentMaxZUnits - contentMinZUnits;
+        if (!totalRows) return { error: "no-renderable" };
+
+        const viewPrimaryMinWorld = directionConfig.primaryAxis === "x" ? viewRect.left : viewRect.top;
+        const viewPrimaryMaxWorld = directionConfig.primaryAxis === "x" ? viewRect.right : viewRect.bottom;
+        const viewPrimaryMinUnits = Math.floor(viewPrimaryMinWorld / unitWorldSize);
+        const totalColumns = Math.max(1, Math.ceil(viewPrimaryMaxWorld / unitWorldSize) - viewPrimaryMinUnits);
+        const frontBoundaryWorld = directionalFrontBoundaryWorld(viewRect, directionConfig, options.frontBoundaryOverride);
+        const hasFrontBoundaryOverride = Number.isFinite(options.frontBoundaryOverride);
+
+        const columnsByLayer = configuredLayers.map(({ layer, config }, orderIndex) => {
+          const colorByColumn = new Map();
+          const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
+          const baseWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.baseElevation)));
+          const heightUnits = gridUnitsForWorldHeight(heightWorld, unitWorldSize);
+          forEachLayerViewRect(layer, directionConfig.primaryAxis === "x" ? "horizontal" : "vertical", viewRect, (rect, sourceColor) => {
+            projectCoverageRectToColumns(
+              colorByColumn,
+              rect,
+              sourceColor,
+              viewPrimaryMinUnits,
+              directionConfig,
+              unitWorldSize,
+              frontBoundaryWorld,
+              hasFrontBoundaryOverride,
+              !!config.excludeFromSectionCut
+            );
+          });
+          return {
+            layerId: layer.id,
+            colorByColumn,
+            overrideColor: state.viewColorOverride ? config.color || layerRepresentativeColor(layer) : null,
+            opacity: Math.max(0, Math.min(1, state.viewColorOverride ? config.opacity : layer.opacity)),
+            outline: !!config.outline,
+            outlineColor: config.outlineColor || state.viewOutlineEffect.color,
+            outlineWidth: config.outlineWidth,
+            excludedFromSectionCut: !!config.excludeFromSectionCut,
+            baseUnits: Math.round(baseWorld / unitWorldSize),
+            heightUnits,
+            orderIndex,
+          };
+        });
+
+        const renderableEntries = columnsByLayer.filter((entry) => entry.heightUnits > 0 && entry.colorByColumn.size > 0);
+        if (!renderableEntries.length) return { error: "no-renderable" };
+
+        let contentMinProjectedColumn = Infinity;
+        let contentMaxProjectedColumn = -Infinity;
+        renderableEntries.forEach((entry) => {
+          entry.colorByColumn.forEach((_, columnIndex) => {
+            const projectedColumnIndex = directionConfig.mirrorColumns ? totalColumns - 1 - columnIndex : columnIndex;
+            if (projectedColumnIndex < contentMinProjectedColumn) contentMinProjectedColumn = projectedColumnIndex;
+            if (projectedColumnIndex > contentMaxProjectedColumn) contentMaxProjectedColumn = projectedColumnIndex;
+          });
+        });
+        if (!Number.isFinite(contentMinProjectedColumn) || !Number.isFinite(contentMaxProjectedColumn)) {
+          return { error: "no-painted" };
+        }
+
+        const globalWUnits = Math.max(
+          1,
+          Math.ceil(globalWidthWorld / unitWorldSize),
+          Math.ceil(globalHeightWorld / unitWorldSize)
+        );
+        const paintedWidth = contentMaxProjectedColumn - contentMinProjectedColumn + 1;
+        const contentColumns = Math.max(globalWUnits, paintedWidth);
+        const horizontalOffset = Math.floor((contentColumns - paintedWidth) / 2);
+        const grid = Array.from({ length: totalRows }, () => Array(contentColumns).fill(null));
+
+        for (const entry of columnsByLayer) {
+          if (!entry.heightUnits || !entry.colorByColumn.size) continue;
+          entry.colorByColumn.forEach((column, columnIndex) => {
+            const projectedColumnIndex = directionConfig.mirrorColumns ? totalColumns - 1 - columnIndex : columnIndex;
+            const adjustedColumnIndex = horizontalOffset + (projectedColumnIndex - contentMinProjectedColumn);
+            if (adjustedColumnIndex < 0 || adjustedColumnIndex >= contentColumns) return;
+            for (let z = entry.baseUnits; z < entry.baseUnits + entry.heightUnits; z += 1) {
+              if (z < contentMinZUnits || z >= contentMaxZUnits) continue;
+              const rowIndex = totalRows - 1 - (z - contentMinZUnits);
+              const existing = grid[rowIndex][adjustedColumnIndex];
+              const candidate = {
+                layerId: entry.layerId,
+                color: entry.overrideColor || column.color,
+                depth: column.depth,
+                isCut: !!column.isCut,
+                isCutGeometry: !!column.isCutGeometry,
+                opacity: entry.opacity,
+                forceOutline: !!entry.outline,
+                outlineColor: entry.outlineColor || state.viewOutlineEffect.color,
+                outlineWidth: Math.max(1, Math.min(12, Math.round(Number(entry.outlineWidth) || 1))),
+                excludedFromSectionCut: !!entry.excludedFromSectionCut,
+                orderIndex: entry.orderIndex,
+              };
+              if (
+                !existing ||
+                (directionConfig.frontBoundary === "min" ? candidate.depth < existing.depth : candidate.depth > existing.depth) ||
+                (candidate.depth === existing.depth && candidate.orderIndex < existing.orderIndex)
+              ) {
+                grid[rowIndex][adjustedColumnIndex] = candidate;
+              }
+            }
+          });
+        }
+
+        return {
+          directionConfig,
+          contentMinProjectedColumn: contentMinProjectedColumn - horizontalOffset,
+          contentMaxZ: contentMaxZUnits,
+          contentColumns,
+          totalRows,
+          grid,
+          gridUnitsPerMeter,
+        };
+      }
+
+      function buildVectorDrivenPlanOcclusionGrid(view, options = {}, configuredLayers = orderedConfiguredLayersForView(view)) {
+        if (!view) return { error: "no-view" };
+        const viewRect = viewBoundsWorldRect(view);
+        if (!viewRect || viewRect.right <= viewRect.left || viewRect.bottom <= viewRect.top) {
+          return { error: "invalid-bounds" };
+        }
+        if (!configuredLayers.length) return { error: "no-layers" };
+
+        const globalExtents = buildViewContentExtentsWorld(view, configuredLayers);
+        if (!globalExtents) return { error: "no-renderable" };
+
+        const unitWorldSize = computeViewGridWorldUnitSize(globalExtents.maxX - globalExtents.minX, globalExtents.maxY - globalExtents.minY);
+        const gridUnitsPerMeter = gridUnitsPerMeterForWorldUnitSize(unitWorldSize);
+        const minXUnits = Math.floor(globalExtents.minX / unitWorldSize);
+        const maxXUnits = Math.ceil(globalExtents.maxX / unitWorldSize);
+        const minYUnits = Math.floor(globalExtents.minY / unitWorldSize);
+        const maxYUnits = Math.ceil(globalExtents.maxY / unitWorldSize);
+        const globalColumns = Math.max(1, maxXUnits - minXUnits);
+        const globalRows = Math.max(1, maxYUnits - minYUnits);
+        const grid = Array.from({ length: globalRows }, () => Array(globalColumns).fill(null));
+
+        let maxTopUnits = -Infinity;
+        const configuredEntries = configuredLayers.map(({ layer, config }, orderIndex) => {
+          const baseWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.baseElevation)));
+          const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
+          const baseUnits = Math.round(baseWorld / unitWorldSize);
+          const heightUnits = gridUnitsForWorldHeight(heightWorld, unitWorldSize);
+          const topUnits = baseUnits + heightUnits;
+          if (heightUnits > 0 && topUnits > maxTopUnits) maxTopUnits = topUnits;
+          return {
+            layer,
+            orderIndex,
+            baseUnits,
+            heightUnits,
+            excludeFromSectionCut: !!config.excludeFromSectionCut,
+            forceOutline: !!config.outline,
+            outlineColor: config.outlineColor || state.viewOutlineEffect.color,
+            outlineWidth: Math.max(1, Math.min(12, Math.round(Number(config.outlineWidth) || 1))),
+            opacity: Math.max(0, Math.min(1, state.viewColorOverride ? config.opacity : layer.opacity)),
+            overrideColor: state.viewColorOverride ? config.color || layerRepresentativeColor(layer) : null,
+          };
+        });
+
+        let planeUnits;
+        if (options.planElevationOverride !== undefined) {
+          planeUnits = Math.round(worldUnitsFromMeters(snapViewElevationMeters(Number(options.planElevationOverride))) / unitWorldSize);
+        } else {
+          planeUnits = (Number.isFinite(maxTopUnits) ? maxTopUnits : 0) + Math.max(1, Math.round(CELL_SIZE / unitWorldSize));
+        }
+        const planeElevation = metersFromWorldUnits(planeUnits * unitWorldSize);
+
+        let hasRenderable = false;
+        for (const entry of configuredEntries) {
+          if (entry.heightUnits <= 0) continue;
+          const topUnits = entry.baseUnits + entry.heightUnits;
+          if (entry.baseUnits > planeUnits) continue;
+          const visibleDepthUnits = Math.min(topUnits, planeUnits);
+          const candidateBase = {
+            layerId: entry.layer.id,
+            depth: visibleDepthUnits,
+            isCut: !entry.excludeFromSectionCut && planeUnits >= entry.baseUnits && planeUnits < topUnits,
+            isCutGeometry: planeUnits >= entry.baseUnits && planeUnits < topUnits,
+            opacity: entry.opacity,
+            forceOutline: entry.forceOutline,
+            outlineColor: entry.outlineColor,
+            outlineWidth: entry.outlineWidth,
+            excludedFromSectionCut: !!entry.excludeFromSectionCut,
+            orderIndex: entry.orderIndex,
+          };
+          forEachLayerViewRect(entry.layer, "horizontal", viewRect, (rect, sourceColor) => {
+            const changed = applyPlanRectToGrid(
+              grid,
+              rect,
+              minXUnits,
+              minYUnits,
+              unitWorldSize,
+              {
+                ...candidateBase,
+                color: entry.overrideColor || sourceColor,
+              }
+            );
+            hasRenderable = hasRenderable || changed;
+          });
+        }
+
+        if (!hasRenderable || !grid.some((row) => row.some(Boolean))) return { error: "no-renderable" };
+
+        return {
+          directionConfig: {
+            primaryAxis: "x",
+            depthAxis: "z",
+            frontBoundary: "max",
+            mirrorColumns: false,
+          },
+          contentMinProjectedColumn: minXUnits,
+          contentMaxProjectedRow: maxYUnits,
+          contentMaxZ: planeUnits,
+          contentColumns: globalColumns,
+          totalRows: globalRows,
+          planeElevation,
+          grid,
+          gridUnitsPerMeter,
+        };
+      }
+
+      function buildDirectionalOcclusionGrid(view, direction, options = {}) {
+        if (!view) return { error: "no-view" };
+        const viewRect = viewBoundsWorldRect(view);
+        if (!viewRect || viewRect.right <= viewRect.left || viewRect.bottom <= viewRect.top) {
+          return { error: "invalid-bounds" };
+        }
+        const configuredLayers = orderedConfiguredLayersForView(view);
+        if (!configuredLayers.length) return { error: "no-layers" };
+        if (!viewHasVectorRenderableLayers(configuredLayers)) {
+          return buildLegacyDirectionalOcclusionGrid(view, direction, options);
+        }
+        return buildVectorDrivenDirectionalOcclusionGrid(view, direction, options, configuredLayers);
+      }
+
+      function buildPlanOcclusionGrid(view, options = {}) {
+        if (!view) return { error: "no-view" };
+        const viewRect = viewBoundsWorldRect(view);
+        if (!viewRect || viewRect.right <= viewRect.left || viewRect.bottom <= viewRect.top) {
+          return { error: "invalid-bounds" };
+        }
+        const configuredLayers = orderedConfiguredLayersForView(view);
+        if (!configuredLayers.length) return { error: "no-layers" };
+        if (!viewHasVectorRenderableLayers(configuredLayers)) {
+          return buildLegacyPlanOcclusionGrid(view, options);
+        }
+        return buildVectorDrivenPlanOcclusionGrid(view, options, configuredLayers);
       }
 
       function dxfNumber(value) {
@@ -5753,7 +6234,15 @@
         }
         const isPlanLike = isPlanDirection || (isSectionDir && sectionInfo && sectionInfo.type === "z");
         if (build.error) return { error: build.error };
-        const { grid, contentMaxZ, contentMinProjectedColumn, contentColumns, directionConfig, contentMaxProjectedRow } = build;
+        const {
+          grid,
+          contentMaxZ,
+          contentMinProjectedColumn,
+          contentColumns,
+          directionConfig,
+          contentMaxProjectedRow,
+          gridUnitsPerMeter = CELLS_PER_METER,
+        } = build;
         const sectionCutEnabled = true;
 
         let visibleGrid;
@@ -5778,13 +6267,13 @@
           const simplified = simplifyOrthogonalLoop(loop);
           if (!simplified.length) return [];
           return simplified.map((point) => ({
-            x: (contentMinProjectedColumn + point.x) / CELLS_PER_METER,
-            y: (isPlanLike ? (contentMaxProjectedRow - point.y) : (contentMaxZ - point.y)) / CELLS_PER_METER,
+            x: (contentMinProjectedColumn + point.x) / gridUnitsPerMeter,
+            y: (isPlanLike ? (contentMaxProjectedRow - point.y) : (contentMaxZ - point.y)) / gridUnitsPerMeter,
           }));
         };
         const toMetersPoint = (point) => ({
-          x: (contentMinProjectedColumn + point.x) / CELLS_PER_METER,
-          y: (isPlanLike ? (contentMaxProjectedRow - point.y) : (contentMaxZ - point.y)) / CELLS_PER_METER,
+          x: (contentMinProjectedColumn + point.x) / gridUnitsPerMeter,
+          y: (isPlanLike ? (contentMaxProjectedRow - point.y) : (contentMaxZ - point.y)) / gridUnitsPerMeter,
         });
 
         let entities = "";
@@ -5837,15 +6326,15 @@
 
         if (!isPlanLike && state.viewEnvironment.horizonEnabled) {
           const horizonMarginMeters = 2;
-          const horizonStartMeters = contentMinProjectedColumn / CELLS_PER_METER - horizonMarginMeters;
-          const horizonEndMeters = (contentMinProjectedColumn + contentColumns) / CELLS_PER_METER + horizonMarginMeters;
+          const horizonStartMeters = contentMinProjectedColumn / gridUnitsPerMeter - horizonMarginMeters;
+          const horizonEndMeters = (contentMinProjectedColumn + contentColumns) / gridUnitsPerMeter + horizonMarginMeters;
           const blockedIntervals = sectionCutEnabled ? buildHorizonGapIntervals(visibleGrid, contentMaxZ) : [];
           if (!blockedIntervals.length) {
             const baseLine = encodeDxfLine("VIEW_HORIZON", { x: horizonStartMeters, y: 0 }, { x: horizonEndMeters, y: 0 });
             entities = sectionCutEnabled ? baseLine + entities : entities + baseLine;
           } else {
             let cursor = horizonStartMeters;
-            const toMetersX = (column) => (contentMinProjectedColumn + column) / CELLS_PER_METER;
+            const toMetersX = (column) => (contentMinProjectedColumn + column) / gridUnitsPerMeter;
             blockedIntervals.forEach(([startColumn, endColumn]) => {
               const blockedStart = toMetersX(startColumn);
               const blockedEnd = toMetersX(endColumn);
@@ -5993,7 +6482,13 @@
             : "Set layer heights in Edit Layers to build this view";
           return;
         }
-        const { directionConfig, contentColumns, totalRows, contentMaxZ } = build;
+        const {
+          directionConfig,
+          contentColumns,
+          totalRows,
+          contentMaxZ,
+          gridUnitsPerMeter = CELLS_PER_METER,
+        } = build;
         const renderGrid = build.grid;
         const renderRows = totalRows;
         const renderColumns = contentColumns;
@@ -6044,7 +6539,7 @@
 
         // metersPerPixel metadata for PDF export
         const backingScaleX = canvas.width / Math.max(1, surfaceWidth);
-        const metersPerCssPixel = 1 / Math.max(1e-9, fitScale * CELLS_PER_METER);
+        const metersPerCssPixel = 1 / Math.max(1e-9, fitScale * gridUnitsPerMeter);
         setPaneMeta({
           metersPerPixel: metersPerCssPixel / Math.max(1e-9, backingScaleX),
           pixelWidth: canvas.width,
@@ -7856,6 +8351,435 @@
         return scene;
       }
 
+      function createLayerDerivedGeometry() {
+        return {
+          revisionKey: "",
+          sampleWorldSize: CELL_SIZE,
+          surfaceBounds: null,
+          worldBounds: null,
+          width: 0,
+          height: 0,
+          packedSamples: new Uint32Array(0),
+          horizontalRuns: [],
+          verticalRuns: [],
+          opGroups: [],
+          styleGroups: [],
+          islands: [],
+          silhouetteLoops: [],
+        };
+      }
+
+      function derivedGeometryOpGroupKey(node) {
+        const style = node?.vectorObject?.style || {};
+        return [
+          node?.compositeMode === "erase" ? "erase" : "paint",
+          style.fillColor || "",
+          style.outlineColor || "",
+          Number(style.outlineWidthCells || 0),
+          style.outlineSide || "",
+          style.noFill ? 1 : 0,
+        ].join("|");
+      }
+
+      function buildLayerDerivedGeometryOpGroups(scene) {
+        const groups = new Map();
+        (scene?.nodes || []).forEach((node, index) => {
+          const key = derivedGeometryOpGroupKey(node);
+          let group = groups.get(key);
+          if (!group) {
+            group = {
+              key,
+              compositeMode: node.compositeMode === "erase" ? "erase" : "paint",
+              style: clonePlainData(node.vectorObject?.style || {}),
+              indices: [],
+              bounds: null,
+            };
+            groups.set(key, group);
+          }
+          group.indices.push(index);
+          group.bounds = combineWorldRects(group.bounds, node.expandedBounds || node.authoredBounds);
+        });
+        return Array.from(groups.values());
+      }
+
+      function packDerivedSampleColor(r, g, b) {
+        return (((b & 255) << 16) | ((g & 255) << 8) | (r & 255)) >>> 0;
+      }
+
+      function packedDerivedColorToHex(packed) {
+        return rgbToHex(packed & 255, (packed >>> 8) & 255, (packed >>> 16) & 255);
+      }
+
+      function buildContoursFromPackedSamples(packedSamples, width, height, predicate) {
+        if (!packedSamples?.length || !width || !height) return [];
+        const isFilled = (row, column) =>
+          row >= 0 &&
+          row < height &&
+          column >= 0 &&
+          column < width &&
+          !!predicate(packedSamples[row * width + column], row, column);
+
+        const edges = [];
+        for (let row = 0; row < height; row += 1) {
+          for (let column = 0; column < width; column += 1) {
+            if (!isFilled(row, column)) continue;
+            if (!isFilled(row - 1, column)) edges.push({ x1: column, y1: row, x2: column + 1, y2: row, used: false });
+            if (!isFilled(row, column + 1)) edges.push({ x1: column + 1, y1: row, x2: column + 1, y2: row + 1, used: false });
+            if (!isFilled(row + 1, column)) edges.push({ x1: column + 1, y1: row + 1, x2: column, y2: row + 1, used: false });
+            if (!isFilled(row, column - 1)) edges.push({ x1: column, y1: row + 1, x2: column, y2: row, used: false });
+          }
+        }
+        if (!edges.length) return [];
+
+        const keyOf = (x, y) => x + ":" + y;
+        const outgoing = new Map();
+        edges.forEach((edge, index) => {
+          const key = keyOf(edge.x1, edge.y1);
+          const list = outgoing.get(key);
+          if (list) list.push(index);
+          else outgoing.set(key, [index]);
+        });
+
+        const pickNextEdge = (x, y, incomingDir) => {
+          const candidates = outgoing.get(keyOf(x, y));
+          if (!candidates || !candidates.length) return -1;
+          const unused = candidates.filter((index) => !edges[index].used);
+          if (!unused.length) return -1;
+          if (incomingDir == null) return unused[0];
+          const priority = [(incomingDir + 1) % 4, incomingDir, (incomingDir + 3) % 4, (incomingDir + 2) % 4];
+          for (const desiredDir of priority) {
+            const match = unused.find((index) => {
+              const edge = edges[index];
+              return gridDirectionIndex(edge.x1, edge.y1, edge.x2, edge.y2) === desiredDir;
+            });
+            if (match !== undefined) return match;
+          }
+          return unused[0];
+        };
+
+        const loops = [];
+        for (let edgeIndex = 0; edgeIndex < edges.length; edgeIndex += 1) {
+          if (edges[edgeIndex].used) continue;
+          const start = edges[edgeIndex];
+          const loop = [{ x: start.x1, y: start.y1 }];
+          let current = edgeIndex;
+          let guard = edges.length * 6;
+          while (current !== -1 && guard > 0) {
+            guard -= 1;
+            const edge = edges[current];
+            if (edge.used) break;
+            edge.used = true;
+            const last = loop[loop.length - 1];
+            if (last.x !== edge.x2 || last.y !== edge.y2) {
+              loop.push({ x: edge.x2, y: edge.y2 });
+            }
+            if (edge.x2 === start.x1 && edge.y2 === start.y1) {
+              loops.push(loop);
+              break;
+            }
+            const incomingDir = gridDirectionIndex(edge.x1, edge.y1, edge.x2, edge.y2);
+            current = pickNextEdge(edge.x2, edge.y2, incomingDir);
+          }
+        }
+
+        return loops.filter((loop) => loop.length >= 4);
+      }
+
+      function buildDerivedHorizontalRuns(packedSamples, width, height) {
+        const runs = [];
+        if (!packedSamples?.length || !width || !height) return runs;
+        for (let rowIndex = 0; rowIndex < height; rowIndex += 1) {
+          let columnIndex = 0;
+          while (columnIndex < width) {
+            const packedColor = packedSamples[rowIndex * width + columnIndex];
+            if (!packedColor) {
+              columnIndex += 1;
+              continue;
+            }
+            let endColumn = columnIndex + 1;
+            while (endColumn < width && packedSamples[rowIndex * width + endColumn] === packedColor) {
+              endColumn += 1;
+            }
+            runs.push({ rowIndex, columnStart: columnIndex, columnEnd: endColumn, packedColor });
+            columnIndex = endColumn;
+          }
+        }
+        return runs;
+      }
+
+      function buildDerivedVerticalRuns(packedSamples, width, height) {
+        const runs = [];
+        if (!packedSamples?.length || !width || !height) return runs;
+        for (let columnIndex = 0; columnIndex < width; columnIndex += 1) {
+          let rowIndex = 0;
+          while (rowIndex < height) {
+            const packedColor = packedSamples[rowIndex * width + columnIndex];
+            if (!packedColor) {
+              rowIndex += 1;
+              continue;
+            }
+            let endRow = rowIndex + 1;
+            while (endRow < height && packedSamples[endRow * width + columnIndex] === packedColor) {
+              endRow += 1;
+            }
+            runs.push({ columnIndex, rowStart: rowIndex, rowEnd: endRow, packedColor });
+            rowIndex = endRow;
+          }
+        }
+        return runs;
+      }
+
+      function derivedGeometrySampleBoundsToWorldRect(surfaceBounds, sampleWorldSize, minColumn, minRow, maxColumn, maxRow) {
+        return {
+          left: surfaceBounds.left + minColumn * sampleWorldSize,
+          top: surfaceBounds.top + minRow * sampleWorldSize,
+          right: surfaceBounds.left + (maxColumn + 1) * sampleWorldSize,
+          bottom: surfaceBounds.top + (maxRow + 1) * sampleWorldSize,
+        };
+      }
+
+      function buildLayerDerivedStyleData(packedSamples, width, height, surfaceBounds, sampleWorldSize) {
+        if (!packedSamples?.length || !width || !height) {
+          return { islands: [], styleGroups: [] };
+        }
+        const visited = new Uint8Array(width * height);
+        const islands = [];
+        const groupsByColor = new Map();
+        const queue = [];
+        const pushNeighbor = (column, row, packedColor) => {
+          if (column < 0 || row < 0 || column >= width || row >= height) return;
+          const index = row * width + column;
+          if (visited[index] || packedSamples[index] !== packedColor) return;
+          visited[index] = 1;
+          queue.push(index);
+        };
+
+        for (let index = 0; index < packedSamples.length; index += 1) {
+          const packedColor = packedSamples[index];
+          if (!packedColor || visited[index]) continue;
+          visited[index] = 1;
+          queue.length = 0;
+          queue.push(index);
+          let minColumn = index % width;
+          let maxColumn = minColumn;
+          let minRow = Math.floor(index / width);
+          let maxRow = minRow;
+          let pixelCount = 0;
+
+          for (let head = 0; head < queue.length; head += 1) {
+            const current = queue[head];
+            const row = Math.floor(current / width);
+            const column = current % width;
+            pixelCount += 1;
+            if (column < minColumn) minColumn = column;
+            if (column > maxColumn) maxColumn = column;
+            if (row < minRow) minRow = row;
+            if (row > maxRow) maxRow = row;
+            pushNeighbor(column - 1, row, packedColor);
+            pushNeighbor(column + 1, row, packedColor);
+            pushNeighbor(column, row - 1, packedColor);
+            pushNeighbor(column, row + 1, packedColor);
+          }
+
+          const island = {
+            packedColor,
+            color: packedDerivedColorToHex(packedColor),
+            pixelCount,
+            sampleBounds: { minColumn, minRow, maxColumn, maxRow },
+            worldBounds: derivedGeometrySampleBoundsToWorldRect(surfaceBounds, sampleWorldSize, minColumn, minRow, maxColumn, maxRow),
+          };
+          islands.push(island);
+
+          let group = groupsByColor.get(packedColor);
+          if (!group) {
+            group = {
+              packedColor,
+              color: island.color,
+              pixelCount: 0,
+              islandCount: 0,
+              bounds: null,
+            };
+            groupsByColor.set(packedColor, group);
+          }
+          group.pixelCount += pixelCount;
+          group.islandCount += 1;
+          group.bounds = combineWorldRects(group.bounds, island.worldBounds);
+        }
+
+        return {
+          islands,
+          styleGroups: Array.from(groupsByColor.values()).sort((a, b) => b.pixelCount - a.pixelCount),
+        };
+      }
+
+      function derivedGeometrySurfaceBounds(rect, sampleWorldSize) {
+        return {
+          left: rect.left - sampleWorldSize,
+          top: rect.top - sampleWorldSize,
+          right: rect.right + sampleWorldSize,
+          bottom: rect.bottom + sampleWorldSize,
+        };
+      }
+
+      function deriveLayerGeometrySampleWorldSize(rect) {
+        const desired = CELL_SIZE / VIEW_VECTOR_GRID_SUBDIVISIONS;
+        if (!rect) return desired;
+        const width = Math.max(0, rect.right - rect.left);
+        const height = Math.max(0, rect.bottom - rect.top);
+        return Math.max(
+          desired,
+          width > 0 ? width / MAX_DERIVED_GEOMETRY_SURFACE_PX : 0,
+          height > 0 ? height / MAX_DERIVED_GEOMETRY_SURFACE_PX : 0
+        );
+      }
+
+      function derivedGeometryProjectPoint(surfaceBounds, sampleWorldSize) {
+        const scale = 1 / sampleWorldSize;
+        const projectPoint = (worldX, worldY) => ({
+          x: (worldX - surfaceBounds.left) * scale,
+          y: (worldY - surfaceBounds.top) * scale,
+        });
+        projectPoint.rotationAngle = 0;
+        return projectPoint;
+      }
+
+      function derivedGeometryNodePixelBounds(node, surfaceBounds, sampleWorldSize, width, height) {
+        const rect = node?.expandedBounds || node?.authoredBounds;
+        if (!rect) return null;
+        const paddingPx = 2;
+        const minX = Math.max(0, Math.floor((rect.left - surfaceBounds.left) / sampleWorldSize) - paddingPx);
+        const minY = Math.max(0, Math.floor((rect.top - surfaceBounds.top) / sampleWorldSize) - paddingPx);
+        const maxX = Math.min(width, Math.ceil((rect.right - surfaceBounds.left) / sampleWorldSize) + paddingPx);
+        const maxY = Math.min(height, Math.ceil((rect.bottom - surfaceBounds.top) / sampleWorldSize) + paddingPx);
+        if (maxX <= minX || maxY <= minY) return null;
+        return {
+          x: minX,
+          y: minY,
+          width: maxX - minX,
+          height: maxY - minY,
+        };
+      }
+
+      function rebuildLayerDerivedGeometry(cache, layer, transform = null) {
+        const scene = ensureLayerVectorScene(layer, transform);
+        cache.revisionKey = scene.revisionKey;
+        cache.sampleWorldSize = CELL_SIZE;
+        cache.surfaceBounds = null;
+        cache.worldBounds = null;
+        cache.width = 0;
+        cache.height = 0;
+        cache.packedSamples = new Uint32Array(0);
+        cache.horizontalRuns = [];
+        cache.verticalRuns = [];
+        cache.opGroups = buildLayerDerivedGeometryOpGroups(scene);
+        cache.styleGroups = [];
+        cache.islands = [];
+        cache.silhouetteLoops = [];
+
+        if (!scene.paintNodeIndices?.length || !scene.paintedBounds) {
+          return cache;
+        }
+
+        const rasterBounds = scene.rasterBounds || scene.paintedBounds;
+        const sampleWorldSize = deriveLayerGeometrySampleWorldSize(rasterBounds);
+        const surfaceBounds = derivedGeometrySurfaceBounds(rasterBounds, sampleWorldSize);
+        const width = Math.max(1, Math.ceil((surfaceBounds.right - surfaceBounds.left) / sampleWorldSize));
+        const height = Math.max(1, Math.ceil((surfaceBounds.bottom - surfaceBounds.top) / sampleWorldSize));
+        const layerCanvas = document.createElement("canvas");
+        const opCanvas = document.createElement("canvas");
+        layerCanvas.width = width;
+        layerCanvas.height = height;
+        opCanvas.width = width;
+        opCanvas.height = height;
+        const layerContext = layerCanvas.getContext("2d");
+        const opContext = opCanvas.getContext("2d");
+        layerContext.imageSmoothingEnabled = false;
+        opContext.imageSmoothingEnabled = false;
+        const projectPoint = derivedGeometryProjectPoint(surfaceBounds, sampleWorldSize);
+        const worldScale = 1 / sampleWorldSize;
+
+        scene.nodes.forEach((node) => {
+          const pixelBounds = derivedGeometryNodePixelBounds(node, surfaceBounds, sampleWorldSize, width, height);
+          if (!pixelBounds) return;
+          opContext.clearRect(pixelBounds.x, pixelBounds.y, pixelBounds.width, pixelBounds.height);
+          renderVectorObjectToContext(
+            opContext,
+            node.vectorObject,
+            node.compositeMode === "erase" ? "mask" : "paint",
+            projectPoint,
+            worldScale
+          );
+          if (node.compositeMode === "erase") {
+            subtractMaskFromLayerContext(layerContext, opContext, pixelBounds);
+            return;
+          }
+          layerContext.drawImage(
+            opCanvas,
+            pixelBounds.x,
+            pixelBounds.y,
+            pixelBounds.width,
+            pixelBounds.height,
+            pixelBounds.x,
+            pixelBounds.y,
+            pixelBounds.width,
+            pixelBounds.height
+          );
+        });
+
+        const imageData = layerContext.getImageData(0, 0, width, height).data;
+        const packedSamples = new Uint32Array(width * height);
+        let minColumn = Infinity;
+        let minRow = Infinity;
+        let maxColumn = -Infinity;
+        let maxRow = -Infinity;
+        for (let index = 0; index < packedSamples.length; index += 1) {
+          const alpha = imageData[index * 4 + 3];
+          if (alpha <= DERIVED_GEOMETRY_ALPHA_THRESHOLD) continue;
+          const packedColor = packDerivedSampleColor(
+            imageData[index * 4],
+            imageData[index * 4 + 1],
+            imageData[index * 4 + 2]
+          );
+          packedSamples[index] = packedColor;
+          const row = Math.floor(index / width);
+          const column = index % width;
+          if (column < minColumn) minColumn = column;
+          if (column > maxColumn) maxColumn = column;
+          if (row < minRow) minRow = row;
+          if (row > maxRow) maxRow = row;
+        }
+
+        cache.sampleWorldSize = sampleWorldSize;
+        cache.surfaceBounds = surfaceBounds;
+        cache.width = width;
+        cache.height = height;
+        cache.packedSamples = packedSamples;
+        cache.horizontalRuns = buildDerivedHorizontalRuns(packedSamples, width, height);
+        cache.verticalRuns = buildDerivedVerticalRuns(packedSamples, width, height);
+        if (Number.isFinite(minColumn) && Number.isFinite(minRow) && Number.isFinite(maxColumn) && Number.isFinite(maxRow)) {
+          cache.worldBounds = derivedGeometrySampleBoundsToWorldRect(surfaceBounds, sampleWorldSize, minColumn, minRow, maxColumn, maxRow);
+        }
+        const styleData = buildLayerDerivedStyleData(packedSamples, width, height, surfaceBounds, sampleWorldSize);
+        cache.islands = styleData.islands;
+        cache.styleGroups = styleData.styleGroups;
+        cache.silhouetteLoops = buildContoursFromPackedSamples(packedSamples, width, height, (packedColor) => packedColor !== 0);
+        return cache;
+      }
+
+      function ensureLayerDerivedGeometry(layer, transform = null) {
+        if (!layer || typeof layer !== "object") return createLayerDerivedGeometry();
+        let cache = layerDerivedGeometryCache.get(layer);
+        if (!cache) {
+          cache = createLayerDerivedGeometry();
+          layerDerivedGeometryCache.set(layer, cache);
+        }
+        const scene = ensureLayerVectorScene(layer, transform || resolveLayerDocumentTransform(layer));
+        if (cache.revisionKey !== scene.revisionKey) {
+          return rebuildLayerDerivedGeometry(cache, layer, transform || resolveLayerDocumentTransform(layer));
+        }
+        return cache;
+      }
+
       function layerVectorScenePointCandidateIndices(scene, worldX, worldY) {
         if (!scene?.nodes.length) return [];
         const tileWorldSize = TILE_SIZE * CELL_SIZE;
@@ -8257,6 +9181,7 @@
       function syncLayerSceneRuntimeContent(entry) {
         const worldScene = ensureLayerVectorScene(entry.layer, entry.transform);
         entry.vectorScene = worldScene;
+        entry.derivedGeometry = ensureLayerDerivedGeometry(entry.layer, entry.transform);
         const runtimeSignature = [
           entry.layer?.vectorRenderRevision || 0,
           entry.transform?.signature || "",
@@ -8331,6 +9256,7 @@
           visible: drawingNode.visible && layer?.visible !== false,
           transform: drawingNode.transform,
           vectorScene: ensureLayerVectorScene(layer, drawingNode.transform),
+          derivedGeometry: ensureLayerDerivedGeometry(layer, drawingNode.transform),
           runtimeVectorScene: null,
           runtimeVectorSceneSignature: "",
         };
@@ -12812,13 +13738,16 @@
         }
       }
 
-      function applyVectorObjectStyle(context, vectorObject) {
-        const style = vectorObject?.style || {};
+      function applyVectorObjectStyle(context, vectorObject, worldScale = state.viewport.zoom, styleOverride = null) {
+        const style = {
+          ...(vectorObject?.style || {}),
+          ...(styleOverride || {}),
+        };
         const shouldFill = !style.noFill && typeof style.fillColor === "string";
         const shouldStroke = typeof style.outlineColor === "string" && Number(style.outlineWidthCells) > 0;
         context.fillStyle = shouldFill ? style.fillColor : "rgba(0,0,0,1)";
         context.strokeStyle = shouldStroke ? style.outlineColor : context.fillStyle;
-        context.lineWidth = Math.max(1, Number(style.outlineWidthCells || 0) * CELL_SIZE * state.viewport.zoom);
+        context.lineWidth = Math.max(1, Number(style.outlineWidthCells || 0) * CELL_SIZE * worldScale);
         return { shouldFill, shouldStroke };
       }
 
@@ -12853,7 +13782,7 @@
         return normalizedX * normalizedX + normalizedY * normalizedY <= 1;
       }
 
-      function drawVectorGeometryPath(context, geometry, projectPoint = worldToScreen) {
+      function drawVectorGeometryPath(context, geometry, projectPoint = worldToScreen, worldScale = state.viewport.zoom) {
         if (!geometry || typeof geometry !== "object") return false;
         if (geometry.type === "rect") {
           const bounds = geometry.bounds;
@@ -12874,8 +13803,8 @@
           const bounds = geometry.bounds;
           if (!bounds) return false;
           const center = projectPoint((bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2);
-          const radiusX = Math.max(0.5, ((bounds.maxX - bounds.minX) * state.viewport.zoom) / 2);
-          const radiusY = Math.max(0.5, ((bounds.maxY - bounds.minY) * state.viewport.zoom) / 2);
+          const radiusX = Math.max(0.5, ((bounds.maxX - bounds.minX) * worldScale) / 2);
+          const radiusY = Math.max(0.5, ((bounds.maxY - bounds.minY) * worldScale) / 2);
           context.beginPath();
           context.ellipse(center.x, center.y, radiusX, radiusY, projectPoint.rotationAngle || 0, 0, Math.PI * 2);
           return true;
@@ -12895,8 +13824,8 @@
           context.ellipse(
             center.x,
             center.y,
-            Math.max(0.5, geometry.radiusX * state.viewport.zoom),
-            Math.max(0.5, geometry.radiusY * state.viewport.zoom),
+            Math.max(0.5, geometry.radiusX * worldScale),
+            Math.max(0.5, geometry.radiusY * worldScale),
             normalizeAngle((geometry.rotation || 0) + (projectPoint.rotationAngle || 0)),
             0,
             Math.PI * 2
@@ -12909,8 +13838,8 @@
           context.ellipse(
             center.x,
             center.y,
-            Math.max(0.5, geometry.radius * state.viewport.zoom),
-            Math.max(0.5, geometry.radius * state.viewport.zoom),
+            Math.max(0.5, geometry.radius * worldScale),
+            Math.max(0.5, geometry.radius * worldScale),
             0,
             0,
             Math.PI * 2
@@ -12930,12 +13859,18 @@
         return false;
       }
 
-      function renderVectorObjectToContext(context, vectorObject, mode = "paint", projectPoint = worldToScreen) {
+      function renderVectorObjectToContext(
+        context,
+        vectorObject,
+        mode = "paint",
+        projectPoint = worldToScreen,
+        worldScale = state.viewport.zoom,
+        styleOverride = null
+      ) {
         if (!vectorObject || typeof vectorObject !== "object") return;
         context.save();
         context.globalCompositeOperation = "source-over";
-        const style = vectorObject?.style || {};
-        const { shouldFill, shouldStroke } = applyVectorObjectStyle(context, vectorObject);
+        const { shouldFill, shouldStroke } = applyVectorObjectStyle(context, vectorObject, worldScale, styleOverride);
         if (mode === "mask") {
           context.fillStyle = "#000000";
           context.strokeStyle = "#000000";
@@ -12954,7 +13889,7 @@
                   }
                 : null);
             if (!geometry) return;
-            if (!drawVectorGeometryPath(context, geometry, projectPoint)) return;
+            if (!drawVectorGeometryPath(context, geometry, projectPoint, worldScale)) return;
             if (shouldFill) context.fill();
             if (shouldStroke) context.stroke();
           });
@@ -12962,7 +13897,7 @@
           return;
         }
 
-        if (drawVectorGeometryPath(context, vectorObject.geometry, projectPoint)) {
+        if (drawVectorGeometryPath(context, vectorObject.geometry, projectPoint, worldScale)) {
           if (shouldFill) context.fill();
           if (shouldStroke) context.stroke();
         }

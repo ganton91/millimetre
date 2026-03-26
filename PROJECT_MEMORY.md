@@ -103,7 +103,7 @@
 
 **Scene-node query rule:** Selection priority, hover hit resolution και active layer/measurement transform-entry checks στο main content πρέπει να περνάνε από shared scene-node query helpers που πατάνε στο `mainContentSceneState`, όχι από ανεξάρτητα ad-hoc loops ανά caller.
 
-**Shared derived geometry rule:** Το επόμενο runtime seam πάνω από τα raw `layer.vectorObjects` πρέπει να είναι per-layer derived geometry cache:
+**Shared derived geometry rule:** Το runtime seam πάνω από τα raw `layer.vectorObjects` είναι per-layer derived geometry cache:
 - connected islands / silhouettes
 - style-aware + composite-aware grouping
 - shared consumer 1 = vector-driven views / documentation
@@ -140,7 +140,7 @@
 - Selection: από outline ή label, όχι από box interior
 - View card: δείχνει dimensions σε meters
 - Layer Properties modal: μόνο layers που τέμνουν το view box — βλ. `AI Memories.md`
-- View Properties modal: μόνο `planElevation` — βλ. `AI Memories.md`
+- View Properties modal: `sectionAxes` + read-only dimensions· το legacy `planElevation` field παραμένει μόνο για backwards compatibility και αγνοείται στο render
 - View rendering settings: Depth Effect (Shadow/Fog) / Outline / Sky / Ground / Override View Colors
 - Depth effect: overlay per-depth-cell (Shadow → black, Fog → sky color) — δεν αλλάζει HSV
 - Global Outline: mass-based/surface-based — clean silhouette + major surface transitions
@@ -176,6 +176,8 @@
 - `buildDirectionalOcclusionGrid(view, direction)`: canonical projected/occlusion grid για side views
 - `buildPlanOcclusionGrid(view)`: canonical grid για plan views
 - Debug: `DEBUG_VIEW_VECTOR_CONTOURS` (default off)
-- Current limitation: τα views παραμένουν cell/occlusion-grid driven, άρα circles / diagonals / smooth silhouettes βγαίνουν ακόμα staircase
-- Next view cut: vector-driven view geometry builder που θα διαβάζει `layer.vectorObjects` + `view.layerConfigs` (`baseElevation`, `height`, `outline`, `excludeFromSectionCut`, κ.λπ.)
+- Current state: όταν ένα view intersect-άρει vector-bearing layers, τα canonical grids χτίζονται από shared derived layer geometry cache (`layerDerivedGeometryCache`) και legacy tiles συμμετέχουν μόνο ως compatibility content
+- Derived geometry contents: adaptive sampled resolved layer surface + `opGroups` + connected `islands` + `silhouetteLoops` + horizontal/vertical run caches
+- Staged fallback: tile-only views συνεχίζουν να περνούν από το legacy cell/occlusion builder για safety/backwards compatibility
+- Current limitation: το documentation path είναι πλέον vector-derived αλλά όχι ακόμα fully analytic boolean/vector solids renderer, άρα εξακολουθεί να είναι sampled approximation και όχι exact curve boolean output
 - Final target: professional-grade vector documentation outputs με continuous geometry, σωστά outlines, σωστές section cuts και depth/shadow behavior που παράγεται από vector truth και όχι από cell occupancy

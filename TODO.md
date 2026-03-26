@@ -94,10 +94,11 @@
 ~~- Επόμενο cut: deeper ενοποίηση hit-testing / selection / transform handles πάνω σε scene-node queries αντί για remaining ad-hoc scans στα raw arrays~~
 ~~- Επόμενο structural cut: μετάβαση από drawing transform metadata `passthrough` σε πραγματικά local-space / container transforms πάνω στο scene graph~~
 ~~- Επόμενο structural cut: μετάβαση από runtime-derived local-space containers σε drawing-local document/history truth για vectors/measurements~~
-- Επόμενο structural cut: shared derived layer geometry cache πάνω από τα `layer.vectorObjects` (connected islands / silhouettes / style-aware + composite-aware grouping) ως runtime-only seam
-- Πρώτος consumer του νέου seam: vector-driven view / documentation pipeline που θα διαβάζει `vectorObjects` + `view.layerConfigs` (`baseElevation`, `height`, `outline`, `excludeFromSectionCut`)
+~~- Επόμενο structural cut: shared derived layer geometry cache πάνω από τα `layer.vectorObjects` (connected islands / silhouettes / style-aware + composite-aware grouping) ως runtime-only seam~~
+~~- Πρώτος consumer του νέου seam: vector-driven view / documentation pipeline που θα διαβάζει `vectorObjects` + `view.layerConfigs` (`baseElevation`, `height`, `outline`, `excludeFromSectionCut`)~~
 - Follow-up interaction cut: connected-shape selection / transform στο main canvas πάνω στο ίδιο derived geometry seam, χωρίς να χαλάσει το stroke-level undo/redo truth
 - Follow-up compatibility cut: ένταξη του legacy tile compatibility path στο ίδιο drawing container model / ownership / transforms, χωρίς να ξαναγίνει main-canvas display truth
+- Follow-up documentation cut: από το τωρινό adaptive sampled vector-derived view grid σε πιο analytic / boolean vector documentation builder για exact circles, diagonals, silhouettes και section cuts
 - Επόμενο μεγάλο cut: display backend πιο vector-native από το current Canvas2D replay/chunk pipeline, χωρίς επιστροφή σε per-cell main rendering
 
 ---

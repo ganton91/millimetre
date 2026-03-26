@@ -211,6 +211,7 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - layer / measurement transform-hit helpers που δέχονται scene entries ή raw entities, αλλά προτιμούν το scene graph όταν είναι fresh
 - Το runtime graph δεν κρατά πια μόνο transform metadata:
   - κάθε `layer` entry κρατά retained world vector scene για render/query/invalidation
+  - κάθε `layer` entry κρατά και shared derived layer geometry cache πάνω από το retained world scene για view/documentation consumers
   - κάθε `layer` entry κρατά και runtime-local vector scene χτισμένο απευθείας από το authored document truth
   - κάθε `measurement` entry κρατά authored-local snapshot + local bounds χτισμένα απευθείας από το measurement document truth
   - τα vector render/query paths δουλεύουν σε world projection, ενώ τα measurement/vector authoring and transform paths δουλεύουν στο ίδιο drawing-local model
@@ -235,12 +236,18 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - νέα και restored vector/measurement δεδομένα αποθηκεύονται drawing-local
   - restore/import/history restore κανονικοποιούν deterministic legacy world-authored content σε drawing-local truth
   - retained world scenes, local runtime scenes και display caches είναι projection/cache truth, όχι document truth
-- Το επόμενο structural cut δεν είναι άμεσο ξήλωμα caches ή history merge. Είναι shared derived layer geometry seam πάνω από τα `layer.vectorObjects`:
-  - connected islands / silhouettes
-  - style-aware και composite-aware grouping
-  - runtime-only, όχι document truth
-  - first consumer = vector-driven view / documentation pipeline
-  - later consumer = connected-shape selection / transform μέσα στο main canvas
+- Υπάρχει πλέον shared derived layer geometry seam (`layerDerivedGeometryCache`) πάνω από τα raw `layer.vectorObjects`:
+  - runtime-only retained/cache truth, keyed by vector revision + drawing transform signature
+  - adaptive sampled layer surface πάνω από το retained world vector scene, όχι rewrite του document truth
+  - `opGroups` από raw paint/erase ops με style-aware + composite-aware grouping
+  - final `styleGroups`, connected `islands` και `silhouetteLoops` από το resolved layer composite
+  - horizontal/vertical run caches για reusable projection/query consumers
+  - stroke-level undo/redo history παραμένει ανέγγιχτο· τα derived islands είναι μόνο runtime geometry
+- Πρώτος consumer του seam είναι πλέον το view/documentation pipeline:
+  - `buildDirectionalOcclusionGrid` / `buildPlanOcclusionGrid` κάνουν dispatch σε hybrid vector-driven builders όταν το intersecting view content έχει vectors
+  - source truth για αυτά τα views = derived vector geometry + legacy tiles ως compatibility content, όχι raw tile grid μόνο
+  - tile-only views παραμένουν προσωρινά στο legacy cell/occlusion builder για staged safety
+  - pane export/PDF/DXF metrics δουλεύουν πλέον σε generic view-grid units, όχι hardcoded 1 unit = 1 cell
 - Η ένταξη του legacy tile compatibility path στο ίδιο drawing container model παραμένει follow-up compatibility cut, όχι το αμέσως επόμενο βήμα
 - Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
 
@@ -252,7 +259,12 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - σωστό authored truth
   - σωστό retained scene/runtime truth
   - και αργότερα σωστό view projection truth
-- Τα views σήμερα παραμένουν cell/occlusion-grid driven, άρα οι κύκλοι / διαγώνιες / smooth outlines δεν έχουν ακόμα περάσει στο documentation pipeline
+- Τα views δεν είναι πια pure cell/occlusion-grid driven όταν υπάρχει vector content:
+  - vector-bearing layers περνούν από derived geometry cache σε adaptive sampled view grids
+  - legacy tile-only views μένουν προσωρινά στο παλιό builder για compatibility
+- Σημερινός περιορισμός του documentation path:
+  - το cut είναι πλέον vector-derived αλλά όχι ακόμα fully analytic boolean/vector solids renderer
+  - οι circles/diagonals/outlines βελτιώνονται από derived sampled silhouettes/runs, όχι ακόμα από exact curve boolean output
 
 ### Basic vector hit model
 
