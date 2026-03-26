@@ -248,6 +248,16 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - source truth για αυτά τα views = derived vector geometry + legacy tiles ως compatibility content, όχι raw tile grid μόνο
   - tile-only views παραμένουν προσωρινά στο legacy cell/occlusion builder για staged safety
   - pane export/PDF/DXF metrics δουλεύουν πλέον σε generic view-grid units, όχι hardcoded 1 unit = 1 cell
+- Πάνω από το shared derived geometry seam υπάρχει πλέον και runtime-only per-view documentation geometry seam (`viewDocumentationGeometryCache`):
+  - cache per view + direction/section πάνω από το current hybrid occlusion build
+  - κρατά resolved documentation metadata (`isPlanLike`, plane/front-boundary resolution, doc unit size)
+  - κρατά projected documentation primitives από derived geometry + legacy tiles ως compatibility input
+  - κρατά reusable visible/cut loops, outline segments, layer-outline groups, ground masks και horizon intervals
+  - render/export consumers δεν ξαναχτίζουν ad-hoc contours από το raw grid σε κάθε caller
+- Πρώτοι direct consumers του νέου view documentation seam:
+  - `renderDirectionalViewOutput`
+  - `buildViewPaneDxfContent`
+  - και οι δύο διαβάζουν πλέον shared prebuilt documentation geometry αντί να ανασυνθέτουν μόνοι τους visible loops / cut loops / outline segments
 - Η ένταξη του legacy tile compatibility path στο ίδιο drawing container model παραμένει follow-up compatibility cut, όχι το αμέσως επόμενο βήμα
 - Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
 
@@ -262,9 +272,14 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 - Τα views δεν είναι πια pure cell/occlusion-grid driven όταν υπάρχει vector content:
   - vector-bearing layers περνούν από derived geometry cache σε adaptive sampled view grids
   - legacy tile-only views μένουν προσωρινά στο παλιό builder για compatibility
+- Το documentation path έχει πλέον δικό του reusable runtime seam:
+  - projected documentation primitives πάνω από το shared derived geometry
+  - resolved visible/cut/outlines/horizon entities για render + DXF consumers
+  - καθαρός διαχωρισμός ανάμεσα σε view documentation truth (runtime/cache) και document/history truth
 - Σημερινός περιορισμός του documentation path:
-  - το cut είναι πλέον vector-derived αλλά όχι ακόμα fully analytic boolean/vector solids renderer
-  - οι circles/diagonals/outlines βελτιώνονται από derived sampled silhouettes/runs, όχι ακόμα από exact curve boolean output
+  - η visibility resolution παραμένει staged hybrid/sampled grid solve για safety/backwards compatibility
+  - τα νέα per-view documentation primitives είναι βήμα προς professional renderer, αλλά όχι ακόμα fully analytic boolean/vector solids output
+  - οι circles/diagonals/outlines βελτιώνονται από derived runs + documentation primitives, όχι ακόμα από exact curve boolean output
 
 ### Basic vector hit model
 

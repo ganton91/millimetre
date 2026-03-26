@@ -2970,6 +2970,7 @@
       const layerChunkRenderCache = new WeakMap();
       const layerVectorSceneCache = new WeakMap();
       const layerDerivedGeometryCache = new WeakMap();
+      const viewDocumentationGeometryCache = new WeakMap();
       const mainContentSceneState = {
         structureSignature: "",
         drawingNodes: [],
@@ -5895,6 +5896,537 @@
         return buildVectorDrivenPlanOcclusionGrid(view, options, configuredLayers);
       }
 
+      function createViewDocumentationGeometryStore() {
+        return {
+          entries: new Map(),
+        };
+      }
+
+      function createViewDocumentationGeometry() {
+        return {
+          revisionKey: "",
+          requestedDirection: "",
+          resolvedDirection: "",
+          sectionInfo: null,
+          isPlanLike: false,
+          build: { error: "no-view" },
+          renderGrid: [],
+          visibleGrid: [],
+          projectedPrimitives: [],
+          projectedSectionPrimitives: [],
+          fillGroups: [],
+          sectionCutFillGroups: [],
+          visibleLoops: [],
+          sectionCutRenderLoops: [],
+          sectionCutVisibleLoops: [],
+          globalMassLoops: [],
+          globalDepthSegments: [],
+          globalOutlineSegments: [],
+          layerOutlinePass1: [],
+          layerOutlinePass2: [],
+          layerOutlineSegments: [],
+          sectionCutOutlineLoops: [],
+          groundHoleMask: [],
+          groundHoleLoops: [],
+          planHoleMask: [],
+          planOverlayLoops: [],
+          planeElevation: null,
+          nearestVisibleDepth: 0,
+          groundOverlayActive: false,
+          horizonGapIntervals: [],
+          docUnitWorldSize: CELL_SIZE,
+        };
+      }
+
+      function viewDocumentationBoundsSignature(view) {
+        const bounds = view?.bounds;
+        if (!bounds) return "no-bounds";
+        return [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].join(":");
+      }
+
+      function viewDocumentationSectionSignature(direction, sectionInfo) {
+        if (!sectionInfo) return direction;
+        const axis = sectionInfo.axis || {};
+        if (sectionInfo.type === "z") {
+          return [direction, sectionInfo.type, axis.id || "", snapViewElevationMeters(Number(axis.elevation))].join(":");
+        }
+        return [
+          direction,
+          sectionInfo.type,
+          axis.id || "",
+          axis.fromSide || "",
+          Math.max(0, Number(axis.distance) || 0),
+          axis.direction || "",
+        ].join(":");
+      }
+
+      function viewDocumentationLayerStateSignature(configuredLayers) {
+        return configuredLayers
+          .map(({ layer, config }) => {
+            const transform = resolveLayerDocumentTransform(layer);
+            const scene = ensureLayerVectorScene(layer, transform);
+            return [
+              layer.id,
+              scene.revisionKey,
+              layer.tileRenderRevision || 0,
+              Math.max(0, Math.min(1, Number(layer.opacity) || 0)),
+              snapViewElevationMeters(Number(config.baseElevation)),
+              snapViewElevationMeters(Number(config.height), { allowNegative: false }),
+              config.color || "",
+              Math.max(0, Math.min(1, Number(config.opacity) || 0)),
+              config.outline ? 1 : 0,
+              config.outlineColor || "",
+              Math.max(0, Math.min(12, Math.round(Number(config.outlineWidth) || 0))),
+              config.excludeFromSectionCut ? 1 : 0,
+              config.hidden ? 1 : 0,
+            ].join(":");
+          })
+          .join("|");
+      }
+
+      function viewDocumentationStyleSignature() {
+        return [
+          state.viewColorOverride ? 1 : 0,
+          state.viewDepthEffect.enabled ? 1 : 0,
+          state.viewDepthEffect.mode || "off",
+          Number(state.viewDepthEffect.strength) || 0,
+          state.viewOutlineEffect.enabled ? 1 : 0,
+          Number(state.viewOutlineEffect.thickness) || 0,
+          state.viewOutlineEffect.color || "",
+          state.viewSectionCutEffect.enabled ? 1 : 0,
+          state.viewSectionCutEffect.color || "",
+          state.viewSectionCutOutlineEffect.enabled ? 1 : 0,
+          Number(state.viewSectionCutOutlineEffect.thickness) || 0,
+          state.viewSectionCutOutlineEffect.color || "",
+          state.viewEnvironment.groundEnabled ? 1 : 0,
+          state.viewEnvironment.groundColor || "",
+          state.viewEnvironment.planGroundEnabled ? 1 : 0,
+          state.viewEnvironment.planGroundColor || "",
+          state.viewEnvironment.planUndergroundEnabled ? 1 : 0,
+          state.viewEnvironment.planUndergroundColor || "",
+          state.viewEnvironment.horizonEnabled ? 1 : 0,
+          state.viewEnvironment.horizonColor || "",
+          Number(state.viewEnvironment.horizonWidth) || 0,
+        ].join("|");
+      }
+
+      function viewDocumentationRevisionKey(request) {
+        return [
+          viewDocumentationBoundsSignature(request.view),
+          viewDocumentationSectionSignature(request.direction, request.sectionInfo),
+          viewDocumentationLayerStateSignature(request.configuredLayers || []),
+          viewDocumentationStyleSignature(),
+        ].join("||");
+      }
+
+      function documentationUnitWorldSize(build) {
+        const gridUnitsPerMeter = build?.gridUnitsPerMeter || CELLS_PER_METER;
+        return WORLD_UNITS_PER_METER / Math.max(1e-9, gridUnitsPerMeter);
+      }
+
+      function documentationPointToMeters(point, documentation) {
+        const build = documentation?.build || {};
+        const unitsPerMeter = build.gridUnitsPerMeter || CELLS_PER_METER;
+        if (documentation?.isPlanLike) {
+          return {
+            x: (build.contentMinProjectedColumn + point.x) / unitsPerMeter,
+            y: (build.contentMaxProjectedRow - point.y) / unitsPerMeter,
+          };
+        }
+        return {
+          x: (build.contentMinProjectedColumn + point.x) / unitsPerMeter,
+          y: (build.contentMaxZ - point.y) / unitsPerMeter,
+        };
+      }
+
+      function documentationLoopToMeters(loop, documentation) {
+        const simplified = simplifyOrthogonalLoop(loop);
+        if (!simplified.length) return [];
+        return simplified.map((point) => documentationPointToMeters(point, documentation));
+      }
+
+      function documentationSegmentToMeters(segment, documentation) {
+        return {
+          start: documentationPointToMeters({ x: segment.x1, y: segment.y1 }, documentation),
+          end: documentationPointToMeters({ x: segment.x2, y: segment.y2 }, documentation),
+        };
+      }
+
+      function resolveViewDocumentationRequest(view, direction) {
+        if (!view) {
+          return {
+            view,
+            direction,
+            resolvedDirection: direction,
+            sectionInfo: null,
+            isPlanLike: direction === "plan",
+            frontBoundaryOverride: undefined,
+            planElevationOverride: undefined,
+            configuredLayers: [],
+            build: { error: "no-view" },
+          };
+        }
+
+        const configuredLayers = orderedConfiguredLayersForView(view);
+        const isPlanDirection = direction === "plan";
+        const isSectionDir = isSectionAxisId(direction);
+        let sectionInfo = null;
+        let frontBoundaryOverride;
+        let planElevationOverride;
+        let resolvedDirection = direction;
+        let build;
+
+        if (isPlanDirection) {
+          build = buildPlanOcclusionGrid(view);
+        } else if (isSectionDir) {
+          sectionInfo = resolveSectionAxisInfo(view, direction);
+          if (!sectionInfo) {
+            build = { error: "no-renderable" };
+          } else if (sectionInfo.type === "z") {
+            planElevationOverride = sectionInfo.axis.elevation;
+            resolvedDirection = "plan";
+            build = buildPlanOcclusionGrid(view, { planElevationOverride });
+          } else {
+            const bounds = viewCellBounds(view.bounds);
+            if (!bounds) {
+              build = { error: "invalid-bounds" };
+            } else {
+              frontBoundaryOverride = computeSectionFrontBoundary(sectionInfo, bounds);
+              resolvedDirection = sectionInfo.axis.direction;
+              build = buildDirectionalOcclusionGrid(view, resolvedDirection, { frontBoundaryOverride });
+            }
+          }
+        } else {
+          build = buildDirectionalOcclusionGrid(view, direction);
+        }
+
+        return {
+          view,
+          direction,
+          resolvedDirection,
+          sectionInfo,
+          isPlanLike: isPlanDirection || !!(sectionInfo && sectionInfo.type === "z"),
+          frontBoundaryOverride,
+          planElevationOverride,
+          configuredLayers,
+          build,
+        };
+      }
+
+      function projectWorldRectToDocumentationRect(rect, request, build, baseWorld, topWorld) {
+        if (!rect) return null;
+        const unitWorldSize = documentationUnitWorldSize(build);
+        if (request.isPlanLike) {
+          return {
+            left: rect.left / unitWorldSize - build.contentMinProjectedColumn,
+            top: build.contentMaxProjectedRow - rect.bottom / unitWorldSize,
+            right: rect.right / unitWorldSize - build.contentMinProjectedColumn,
+            bottom: build.contentMaxProjectedRow - rect.top / unitWorldSize,
+          };
+        }
+        const directionConfig = build.directionConfig || directionalViewConfig(request.resolvedDirection);
+        const primaryMinWorld = directionConfig.primaryAxis === "x" ? rect.left : rect.top;
+        const primaryMaxWorld = directionConfig.primaryAxis === "x" ? rect.right : rect.bottom;
+        const depthMinWorld = directionConfig.depthAxis === "x" ? rect.left : rect.top;
+        const depthMaxWorld = directionConfig.depthAxis === "x" ? rect.right : rect.bottom;
+        return {
+          left: primaryMinWorld / unitWorldSize - build.contentMinProjectedColumn,
+          top: build.contentMaxZ - topWorld / unitWorldSize,
+          right: primaryMaxWorld / unitWorldSize - build.contentMinProjectedColumn,
+          bottom: build.contentMaxZ - baseWorld / unitWorldSize,
+          depthMin: depthMinWorld / unitWorldSize,
+          depthMax: depthMaxWorld / unitWorldSize,
+        };
+      }
+
+      function buildViewDocumentationProjectedPrimitives(request) {
+        const build = request.build;
+        if (build?.error || !request.view) {
+          return { projectedPrimitives: [], projectedSectionPrimitives: [] };
+        }
+        const viewRect = viewBoundsWorldRect(request.view);
+        if (!viewRect) return { projectedPrimitives: [], projectedSectionPrimitives: [] };
+        const projectedPrimitives = [];
+        const projectedSectionPrimitives = [];
+        const directionConfig = build.directionConfig || directionalViewConfig(request.resolvedDirection);
+        const frontBoundaryWorld = request.isPlanLike
+          ? null
+          : directionalFrontBoundaryWorld(viewRect, directionConfig, request.frontBoundaryOverride);
+        const planeWorld = request.isPlanLike
+          ? worldUnitsFromMeters(snapViewElevationMeters(Number(build.planeElevation)))
+          : null;
+        const orientation = request.isPlanLike
+          ? "horizontal"
+          : directionConfig.primaryAxis === "x"
+          ? "horizontal"
+          : "vertical";
+
+        request.configuredLayers.forEach(({ layer, config }, orderIndex) => {
+          const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
+          if (heightWorld <= 0) return;
+          const baseWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.baseElevation)));
+          const topWorld = baseWorld + heightWorld;
+          const cutOnPlane = request.isPlanLike
+            ? planeWorld >= baseWorld && planeWorld < topWorld
+            : null;
+          forEachLayerViewRect(layer, orientation, viewRect, (rect, sourceColor) => {
+            const docRect = projectWorldRectToDocumentationRect(rect, request, build, baseWorld, topWorld);
+            if (!docRect || docRect.right <= docRect.left || docRect.bottom <= docRect.top) return;
+            let isCutGeometry = false;
+            if (request.isPlanLike) {
+              isCutGeometry = !!cutOnPlane;
+            } else {
+              const depthMinWorld = directionConfig.depthAxis === "x" ? rect.left : rect.top;
+              const depthMaxWorld = directionConfig.depthAxis === "x" ? rect.right : rect.bottom;
+              isCutGeometry = directionConfig.frontBoundary === "min"
+                ? depthMinWorld <= frontBoundaryWorld && frontBoundaryWorld < depthMaxWorld
+                : depthMinWorld < frontBoundaryWorld && frontBoundaryWorld <= depthMaxWorld;
+            }
+            const primitive = {
+              layerId: layer.id,
+              orderIndex,
+              color: state.viewColorOverride ? config.color || layerRepresentativeColor(layer) : sourceColor,
+              sourceColor,
+              opacity: Math.max(0, Math.min(1, state.viewColorOverride ? config.opacity : layer.opacity)),
+              forceOutline: !!config.outline,
+              outlineColor: config.outlineColor || state.viewOutlineEffect.color,
+              outlineWidth: Math.max(1, Math.min(12, Math.round(Number(config.outlineWidth) || 1))),
+              excludeFromSectionCut: !!config.excludeFromSectionCut,
+              isCut: !config.excludeFromSectionCut && isCutGeometry,
+              isCutGeometry,
+              rect: docRect,
+            };
+            projectedPrimitives.push(primitive);
+            if (primitive.isCutGeometry) projectedSectionPrimitives.push(primitive);
+          });
+        });
+
+        return { projectedPrimitives, projectedSectionPrimitives };
+      }
+
+      function buildViewSectionCutFillGroups(renderGrid, cutColor) {
+        const fillStyles = new Set();
+        for (let r = 0; r < renderGrid.length; r += 1) {
+          const row = renderGrid[r] || [];
+          for (let c = 0; c < row.length; c += 1) {
+            const cell = row[c];
+            if (cell && cell.isCut) fillStyles.add(hexToRgba(cutColor, cell.opacity));
+          }
+        }
+        return Array.from(fillStyles)
+          .map((fillStyle) => ({
+            fillStyle,
+            loops: buildViewContoursFromGrid(renderGrid, (cell) => !!cell && !!cell.isCut && hexToRgba(cutColor, cell.opacity) === fillStyle),
+          }))
+          .filter((group) => group.loops.length);
+      }
+
+      function buildViewDocumentationLayerOutlineGroups(renderGrid, includeExcludedFromSectionCut, visibilityTest = null) {
+        const groups = new Map();
+        for (let r = 0; r < renderGrid.length; r += 1) {
+          const row = renderGrid[r] || [];
+          for (let c = 0; c < row.length; c += 1) {
+            const cell = row[c];
+            if (!cell || !cell.forceOutline) continue;
+            if (!!cell.excludedFromSectionCut !== !!includeExcludedFromSectionCut) continue;
+            if (visibilityTest && !visibilityTest(r, c)) continue;
+            const key = (cell.outlineColor || state.viewOutlineEffect.color) + ":" + (cell.outlineWidth || 1);
+            if (!groups.has(key)) {
+              groups.set(key, {
+                key,
+                color: cell.outlineColor || state.viewOutlineEffect.color,
+                width: Math.max(1, Math.min(12, Math.round(Number(cell.outlineWidth) || 1))),
+              });
+            }
+          }
+        }
+        return Array.from(groups.values())
+          .map((group) => ({
+            ...group,
+            loops: buildViewContoursFromGrid(renderGrid, (cell, r, c) => {
+              if (!cell || !cell.forceOutline) return false;
+              if (!!cell.excludedFromSectionCut !== !!includeExcludedFromSectionCut) return false;
+              if ((cell.outlineColor || state.viewOutlineEffect.color) + ":" + (cell.outlineWidth || 1) !== group.key) return false;
+              return visibilityTest ? visibilityTest(r, c) : true;
+            }),
+          }))
+          .filter((group) => group.loops.length);
+      }
+
+      function buildViewDocumentationDepthSegments(renderGrid, visibilityTest) {
+        const segments = [];
+        const rowCount = renderGrid.length;
+        const columnCount = rowCount ? (renderGrid[0] ? renderGrid[0].length : 0) : 0;
+        for (let r = 0; r < rowCount; r += 1) {
+          for (let c = 0; c < columnCount; c += 1) {
+            const cell = renderGrid[r][c];
+            if (!cell || cell.isCut || !visibilityTest(r, c)) continue;
+            if (c + 1 < columnCount) {
+              const right = renderGrid[r][c + 1];
+              if (right && !right.isCut && visibilityTest(r, c + 1) && right.depth !== cell.depth) {
+                segments.push({ x1: c + 1, y1: r, x2: c + 1, y2: r + 1 });
+              }
+            }
+            if (r + 1 < rowCount) {
+              const bottom = renderGrid[r + 1][c];
+              if (bottom && !bottom.isCut && visibilityTest(r + 1, c) && bottom.depth !== cell.depth) {
+                segments.push({ x1: c, y1: r + 1, x2: c + 1, y2: r + 1 });
+              }
+            }
+          }
+        }
+        return mergeOrthogonalSegments(segments);
+      }
+
+      function rebuildViewDocumentationGeometry(cache, request) {
+        Object.assign(cache, createViewDocumentationGeometry());
+        cache.revisionKey = viewDocumentationRevisionKey(request);
+        cache.requestedDirection = request.direction;
+        cache.resolvedDirection = request.resolvedDirection;
+        cache.sectionInfo = request.sectionInfo ? clonePlainData(request.sectionInfo) : null;
+        cache.isPlanLike = request.isPlanLike;
+        cache.build = request.build;
+
+        const build = request.build;
+        if (build?.error) return cache;
+
+        const renderGrid = build.grid || [];
+        cache.renderGrid = renderGrid;
+        cache.docUnitWorldSize = documentationUnitWorldSize(build);
+
+        const visibleGrid = request.isPlanLike
+          ? renderGrid.map((row) => row.slice())
+          : applyGroundMaskToVisibleGrid(
+              renderGrid.map((row, rowIndex) => {
+                const cellZ = build.contentMaxZ - 1 - rowIndex;
+                return row.map((cell) => {
+                  if (!cell) return null;
+                  if (cellZ < 0) return null;
+                  return cell;
+                });
+              }),
+              build.contentMaxZ
+            );
+        cache.visibleGrid = visibleGrid;
+
+        const planeElevation = request.isPlanLike
+          ? request.sectionInfo && request.sectionInfo.type === "z"
+            ? snapViewElevationMeters(Number(request.sectionInfo.axis.elevation))
+            : build.planeElevation
+          : null;
+        cache.planeElevation = planeElevation;
+        cache.groundHoleMask = request.isPlanLike ? [] : buildGroundHoleMaskFromGrid(renderGrid, build.contentMaxZ);
+        cache.planHoleMask = request.isPlanLike ? buildGroundHoleMaskFromGrid(renderGrid, 0) : [];
+        cache.groundOverlayActive = !request.isPlanLike
+          ? state.viewEnvironment.groundEnabled
+          : (planeElevation >= 0 && state.viewEnvironment.planGroundEnabled) ||
+            (planeElevation < 0 && state.viewEnvironment.planUndergroundEnabled);
+        cache.groundHoleLoops = request.isPlanLike
+          ? []
+          : buildViewContoursFromGrid(renderGrid, (cell, r, c) => {
+              return r >= build.contentMaxZ && !!cache.groundHoleMask[r] && cache.groundHoleMask[r][c];
+            });
+        cache.planOverlayLoops = request.isPlanLike
+          ? buildViewContoursFromGrid(renderGrid, (cell, r, c) => {
+              return (!!cache.planHoleMask[r] && cache.planHoleMask[r][c]) || !!(cell && cell.depth > 0);
+            })
+          : [];
+
+        const visibilityTest = (rowIndex, columnIndex) => {
+          if (!cache.groundOverlayActive) return true;
+          if (!request.isPlanLike) {
+            if (rowIndex < build.contentMaxZ) return true;
+            return !!cache.groundHoleMask[rowIndex] && cache.groundHoleMask[rowIndex][columnIndex];
+          }
+          const planCell = renderGrid[rowIndex] ? renderGrid[rowIndex][columnIndex] : null;
+          return (!!cache.planHoleMask[rowIndex] && cache.planHoleMask[rowIndex][columnIndex]) || !!(planCell && planCell.depth > 0);
+        };
+
+        let nearestVisibleDepth = build.directionConfig?.frontBoundary === "min" ? Infinity : -Infinity;
+        for (let r = 0; r < renderGrid.length; r += 1) {
+          const row = renderGrid[r] || [];
+          for (let c = 0; c < row.length; c += 1) {
+            const cell = row[c];
+            if (!cell) continue;
+            if (build.directionConfig?.frontBoundary === "min") {
+              if (cell.depth < nearestVisibleDepth) nearestVisibleDepth = cell.depth;
+            } else if (cell.depth > nearestVisibleDepth) {
+              nearestVisibleDepth = cell.depth;
+            }
+          }
+        }
+        cache.nearestVisibleDepth = Number.isFinite(nearestVisibleDepth) ? nearestVisibleDepth : 0;
+
+        const projected = buildViewDocumentationProjectedPrimitives(request);
+        cache.projectedPrimitives = projected.projectedPrimitives;
+        cache.projectedSectionPrimitives = projected.projectedSectionPrimitives;
+        cache.fillGroups = buildViewVectorFillGroups(renderGrid, cache.nearestVisibleDepth, build.directionConfig);
+        cache.sectionCutFillGroups = buildViewSectionCutFillGroups(
+          renderGrid,
+          state.viewSectionCutEffect.color || defaultViewSectionCutColor()
+        );
+        cache.visibleLoops = buildViewContoursFromGrid(visibleGrid, (cell) => !!cell);
+        cache.sectionCutRenderLoops = buildViewContoursFromGrid(renderGrid, (cell) => !!(cell && cell.isCut));
+        cache.sectionCutVisibleLoops = buildViewContoursFromGrid(visibleGrid, (cell) => !!(cell && cell.isCut));
+        cache.sectionCutOutlineLoops = cache.sectionCutRenderLoops;
+        cache.globalMassLoops = state.viewOutlineEffect.enabled
+          ? buildViewContoursFromGrid(renderGrid, (cell, r, c) => !!cell && !cell.isCut && visibilityTest(r, c))
+          : [];
+        cache.globalDepthSegments = state.viewOutlineEffect.enabled
+          ? buildViewDocumentationDepthSegments(renderGrid, visibilityTest)
+          : [];
+        cache.globalOutlineSegments = state.viewOutlineEffect.enabled
+          ? mergeOrthogonalSegments(
+              collectDxfBoundarySegments(
+                visibleGrid,
+                (cell, neighbor) => !!cell && (!neighbor || neighbor.depth !== cell.depth || neighbor.isCut !== cell.isCut)
+              )
+            )
+          : [];
+        cache.layerOutlinePass1 = buildViewDocumentationLayerOutlineGroups(renderGrid, false);
+        cache.layerOutlinePass2 = buildViewDocumentationLayerOutlineGroups(renderGrid, true, visibilityTest);
+        cache.layerOutlineSegments = mergeOrthogonalSegments(
+          collectDxfBoundarySegments(visibleGrid, (cell, neighbor) => {
+            if (!cell || !cell.forceOutline) return false;
+            if (!neighbor) return true;
+            const surfaceChanged = neighbor.depth !== cell.depth || neighbor.isCut !== cell.isCut;
+            if (surfaceChanged) {
+              if (build.directionConfig.frontBoundary === "min") return neighbor.depth > cell.depth;
+              return neighbor.depth < cell.depth;
+            }
+            if (neighbor.layerId === cell.layerId) return false;
+            if (cell.forceOutline && !neighbor.forceOutline) return true;
+            if (!cell.forceOutline && neighbor.forceOutline) return false;
+            return cell.orderIndex <= neighbor.orderIndex;
+          })
+        );
+        cache.horizonGapIntervals = !request.isPlanLike && state.viewEnvironment.horizonEnabled
+          ? buildHorizonGapIntervals(visibleGrid, build.contentMaxZ)
+          : [];
+        return cache;
+      }
+
+      function ensureViewDocumentationGeometry(view, direction) {
+        if (!view) return createViewDocumentationGeometry();
+        let store = viewDocumentationGeometryCache.get(view);
+        if (!store) {
+          store = createViewDocumentationGeometryStore();
+          viewDocumentationGeometryCache.set(view, store);
+        }
+        const request = resolveViewDocumentationRequest(view, direction);
+        const cacheKey = viewDocumentationSectionSignature(direction, request.sectionInfo);
+        let cache = store.entries.get(cacheKey);
+        if (!cache) {
+          cache = createViewDocumentationGeometry();
+          store.entries.set(cacheKey, cache);
+        }
+        const revisionKey = viewDocumentationRevisionKey(request);
+        if (cache.revisionKey !== revisionKey) {
+          return rebuildViewDocumentationGeometry(cache, request);
+        }
+        return cache;
+      }
+
       function dxfNumber(value) {
         if (!Number.isFinite(value)) return "0";
         const normalized = Math.abs(value) < 1e-10 ? 0 : value;
@@ -6212,129 +6744,54 @@
         const view = activeCanvasView();
         if (!view) return { error: "no-view" };
         const direction = currentPaneDirections()[slotIndex];
-        const isPlanDirection = direction === "plan";
-        const isSectionDir = isSectionAxisId(direction);
-        let sectionInfo = null;
-        let build;
-        if (isPlanDirection) {
-          build = buildPlanOcclusionGrid(view);
-        } else if (isSectionDir) {
-          sectionInfo = resolveSectionAxisInfo(view, direction);
-          if (!sectionInfo) return { error: "no-renderable" };
-          if (sectionInfo.type === "z") {
-            build = buildPlanOcclusionGrid(view, { planElevationOverride: sectionInfo.axis.elevation });
-          } else {
-            const bounds = viewCellBounds(view.bounds);
-            if (!bounds) return { error: "invalid-bounds" };
-            const frontBoundaryOverride = computeSectionFrontBoundary(sectionInfo, bounds);
-            build = buildDirectionalOcclusionGrid(view, sectionInfo.axis.direction, { frontBoundaryOverride });
-          }
-        } else {
-          build = buildDirectionalOcclusionGrid(view, direction);
-        }
-        const isPlanLike = isPlanDirection || (isSectionDir && sectionInfo && sectionInfo.type === "z");
+        const documentation = ensureViewDocumentationGeometry(view, direction);
+        const build = documentation.build;
+        const isPlanLike = documentation.isPlanLike;
         if (build.error) return { error: build.error };
-        const {
-          grid,
-          contentMaxZ,
-          contentMinProjectedColumn,
-          contentColumns,
-          directionConfig,
-          contentMaxProjectedRow,
-          gridUnitsPerMeter = CELLS_PER_METER,
-        } = build;
-        const sectionCutEnabled = true;
-
-        let visibleGrid;
-        if (isPlanLike) {
-          visibleGrid = grid.map((row) => row.slice());
-        } else {
-          visibleGrid = grid.map((row, rowIndex) => {
-            const cellZ = contentMaxZ - 1 - rowIndex;
-            return row.map((cell) => {
-              if (!cell) return null;
-              if (!sectionCutEnabled && cellZ < 0) return null;
-              return cell;
-            });
-          });
-          visibleGrid = applyGroundMaskToVisibleGrid(visibleGrid, contentMaxZ);
-        }
-
-        const hasVisibleCells = visibleGrid.some((row) => row.some(Boolean));
+        const hasVisibleCells = documentation.visibleGrid.some((row) => row.some(Boolean));
         if (!hasVisibleCells) return { error: "no-entities" };
 
-        const toMetersPoints = (loop) => {
-          const simplified = simplifyOrthogonalLoop(loop);
-          if (!simplified.length) return [];
-          return simplified.map((point) => ({
-            x: (contentMinProjectedColumn + point.x) / gridUnitsPerMeter,
-            y: (isPlanLike ? (contentMaxProjectedRow - point.y) : (contentMaxZ - point.y)) / gridUnitsPerMeter,
-          }));
-        };
-        const toMetersPoint = (point) => ({
-          x: (contentMinProjectedColumn + point.x) / gridUnitsPerMeter,
-          y: (isPlanLike ? (contentMaxProjectedRow - point.y) : (contentMaxZ - point.y)) / gridUnitsPerMeter,
-        });
-
         let entities = "";
-        const visibleLoops = buildViewContoursFromGrid(visibleGrid, (cell) => !!cell);
-        visibleLoops.forEach((loop) => {
-          entities += encodeDxfPolyline("VIEW_VISIBLE", toMetersPoints(loop));
+        documentation.visibleLoops.forEach((loop) => {
+          entities += encodeDxfPolyline("VIEW_VISIBLE", documentationLoopToMeters(loop, documentation));
         });
 
-        if (sectionCutEnabled) {
-          const cutLoops = buildViewContoursFromGrid(visibleGrid, (cell) => !!(cell && cell.isCut));
-          cutLoops.forEach((loop) => {
-            entities += encodeDxfPolyline("VIEW_SECTION_CUT", toMetersPoints(loop));
-          });
-        }
+        documentation.sectionCutVisibleLoops.forEach((loop) => {
+          entities += encodeDxfPolyline("VIEW_SECTION_CUT", documentationLoopToMeters(loop, documentation));
+        });
 
         if (state.viewOutlineEffect.enabled) {
-          const globalOutlineSegments = mergeOrthogonalSegments(collectDxfBoundarySegments(
-            visibleGrid,
-            (cell, neighbor) => !!cell && (!neighbor || neighbor.depth !== cell.depth || neighbor.isCut !== cell.isCut)
-          ));
-          globalOutlineSegments.forEach((segment) => {
+          documentation.globalOutlineSegments.forEach((segment) => {
+            const meters = documentationSegmentToMeters(segment, documentation);
             entities += encodeDxfLine(
               "VIEW_OUTLINE_GLOBAL",
-              toMetersPoint({ x: segment.x1, y: segment.y1 }),
-              toMetersPoint({ x: segment.x2, y: segment.y2 })
+              meters.start,
+              meters.end
             );
           });
         }
 
-        const layerOutlineSegments = mergeOrthogonalSegments(collectDxfBoundarySegments(visibleGrid, (cell, neighbor) => {
-          if (!cell || !cell.forceOutline) return false;
-          if (!neighbor) return true;
-          const surfaceChanged = neighbor.depth !== cell.depth || neighbor.isCut !== cell.isCut;
-          if (surfaceChanged) {
-            if (directionConfig.frontBoundary === "min") return neighbor.depth > cell.depth;
-            return neighbor.depth < cell.depth;
-          }
-          if (neighbor.layerId === cell.layerId) return false;
-          if (cell.forceOutline && !neighbor.forceOutline) return true;
-          if (!cell.forceOutline && neighbor.forceOutline) return false;
-          return cell.orderIndex <= neighbor.orderIndex;
-        }));
-        layerOutlineSegments.forEach((segment) => {
+        documentation.layerOutlineSegments.forEach((segment) => {
+          const meters = documentationSegmentToMeters(segment, documentation);
           entities += encodeDxfLine(
             "VIEW_OUTLINE_LAYER",
-            toMetersPoint({ x: segment.x1, y: segment.y1 }),
-            toMetersPoint({ x: segment.x2, y: segment.y2 })
+            meters.start,
+            meters.end
           );
         });
 
         if (!isPlanLike && state.viewEnvironment.horizonEnabled) {
+          const gridUnitsPerMeter = build.gridUnitsPerMeter || CELLS_PER_METER;
           const horizonMarginMeters = 2;
-          const horizonStartMeters = contentMinProjectedColumn / gridUnitsPerMeter - horizonMarginMeters;
-          const horizonEndMeters = (contentMinProjectedColumn + contentColumns) / gridUnitsPerMeter + horizonMarginMeters;
-          const blockedIntervals = sectionCutEnabled ? buildHorizonGapIntervals(visibleGrid, contentMaxZ) : [];
+          const horizonStartMeters = build.contentMinProjectedColumn / gridUnitsPerMeter - horizonMarginMeters;
+          const horizonEndMeters = (build.contentMinProjectedColumn + build.contentColumns) / gridUnitsPerMeter + horizonMarginMeters;
+          const blockedIntervals = documentation.horizonGapIntervals;
           if (!blockedIntervals.length) {
             const baseLine = encodeDxfLine("VIEW_HORIZON", { x: horizonStartMeters, y: 0 }, { x: horizonEndMeters, y: 0 });
-            entities = sectionCutEnabled ? baseLine + entities : entities + baseLine;
+            entities = baseLine + entities;
           } else {
             let cursor = horizonStartMeters;
-            const toMetersX = (column) => (contentMinProjectedColumn + column) / gridUnitsPerMeter;
+            const toMetersX = (column) => (build.contentMinProjectedColumn + column) / gridUnitsPerMeter;
             blockedIntervals.forEach(([startColumn, endColumn]) => {
               const blockedStart = toMetersX(startColumn);
               const blockedEnd = toMetersX(endColumn);
@@ -6382,6 +6839,15 @@
           ctx.lineTo(loop[i].x, loop[i].y);
         }
         ctx.closePath();
+      }
+
+      function applyDocumentationSegmentsPath(ctx, segments) {
+        if (!Array.isArray(segments) || !segments.length) return;
+        ctx.beginPath();
+        segments.forEach((segment) => {
+          ctx.moveTo(segment.x1, segment.y1);
+          ctx.lineTo(segment.x2, segment.y2);
+        });
       }
 
       function buildViewVectorFillGroups(renderGrid, nearestVisibleDepth, directionConfig) {
@@ -6435,23 +6901,9 @@
             return;
           }
         }
-        let build;
-        if (isPlanDirection) {
-          build = buildPlanOcclusionGrid(view);
-        } else if (isSectionDir && sectionInfo.type === "z") {
-          build = buildPlanOcclusionGrid(view, { planElevationOverride: sectionInfo.axis.elevation });
-        } else if (isSectionDir) {
-          const bounds = viewCellBounds(view && view.bounds);
-          if (!bounds) {
-            build = { error: "invalid-bounds" };
-          } else {
-            const frontBoundaryOverride = computeSectionFrontBoundary(sectionInfo, bounds);
-            build = buildDirectionalOcclusionGrid(view, sectionInfo.axis.direction, { frontBoundaryOverride });
-          }
-        } else {
-          build = buildDirectionalOcclusionGrid(view, direction);
-        }
-        const isPlanLike = isPlanDirection || (isSectionDir && sectionInfo && sectionInfo.type === "z");
+        const documentation = view ? ensureViewDocumentationGeometry(view, direction) : createViewDocumentationGeometry();
+        const build = documentation.build;
+        const isPlanLike = documentation.isPlanLike;
         if (build.error === "no-view") {
           setPaneMeta(null);
           canvas.classList.add("hidden");
@@ -6489,7 +6941,7 @@
           contentMaxZ,
           gridUnitsPerMeter = CELLS_PER_METER,
         } = build;
-        const renderGrid = build.grid;
+        const renderGrid = documentation.renderGrid;
         const renderRows = totalRows;
         const renderColumns = contentColumns;
 
@@ -6562,20 +7014,6 @@
         // Row where z=0 sits in cell-space (boundary between above-ground and underground)
         const undergroundStartRow = contentMaxZ;
 
-        // === Nearest visible depth ===
-        let nearestVisibleDepth = directionConfig.frontBoundary === "min" ? Infinity : -Infinity;
-        for (let r = 0; r < renderRows; r += 1) {
-          for (let c = 0; c < renderColumns; c += 1) {
-            const cell = renderGrid[r][c];
-            if (!cell) continue;
-            if (directionConfig.frontBoundary === "min") {
-              if (cell.depth < nearestVisibleDepth) nearestVisibleDepth = cell.depth;
-            } else {
-              if (cell.depth > nearestVisibleDepth) nearestVisibleDepth = cell.depth;
-            }
-          }
-        }
-
         // === Background (sky only for side views — plan background is handled by ground overlay) ===
         if (!isPlanLike) {
           context.save();
@@ -6585,14 +7023,10 @@
           context.restore();
         }
 
-        // === Ground hole mask (flood-fill, unchanged compute) ===
-        const groundHoleMask = buildGroundHoleMaskFromGrid(renderGrid, undergroundStartRow);
-
         // === Vector fills (non-cut cells grouped by depth-shaded fill style) ===
         {
-          const fillGroups = buildViewVectorFillGroups(renderGrid, nearestVisibleDepth, directionConfig);
           context.save();
-          for (const group of fillGroups) {
+          for (const group of documentation.fillGroups) {
             context.beginPath();
             for (const loop of group.loops) applyViewContourPath(context, loop);
             context.fillStyle = group.fillStyle;
@@ -6603,30 +7037,11 @@
 
         // === Per-layer outlines — pass 1: normal layers (not excluded from section cut) ===
         {
-          const layerOutlineGroups = new Map();
-          for (let r = 0; r < renderRows; r += 1) {
-            for (let c = 0; c < renderColumns; c += 1) {
-              const cell = renderGrid[r][c];
-              if (!cell || !cell.forceOutline || cell.excludedFromSectionCut) continue;
-              const key = (cell.outlineColor || state.viewOutlineEffect.color) + ":" + (cell.outlineWidth || 1);
-              if (!layerOutlineGroups.has(key)) {
-                layerOutlineGroups.set(key, {
-                  color: cell.outlineColor || state.viewOutlineEffect.color,
-                  width: Math.max(1, Math.min(12, Math.round(Number(cell.outlineWidth) || 1))),
-                });
-              }
-            }
-          }
-          if (layerOutlineGroups.size) {
+          if (documentation.layerOutlinePass1.length) {
             context.save();
-            for (const [key, group] of layerOutlineGroups) {
-              const loops = buildViewContoursFromGrid(renderGrid, (cell) => {
-                if (!cell || !cell.forceOutline || cell.excludedFromSectionCut) return false;
-                return (cell.outlineColor || state.viewOutlineEffect.color) + ":" + (cell.outlineWidth || 1) === key;
-              });
-              if (!loops.length) continue;
+            for (const group of documentation.layerOutlinePass1) {
               context.beginPath();
-              for (const loop of loops) applyViewContourPath(context, loop);
+              for (const loop of group.loops) applyViewContourPath(context, loop);
               context.strokeStyle = group.color;
               context.lineWidth = px(group.width);
               context.lineJoin = "miter";
@@ -6639,25 +7054,12 @@
 
         // === Section cut fills ===
         {
-          const cutColor = state.viewSectionCutEffect.color || defaultViewSectionCutColor();
-          const cutFillStyles = new Set();
-          for (let r = 0; r < renderRows; r += 1) {
-            for (let c = 0; c < renderColumns; c += 1) {
-              const cell = renderGrid[r][c];
-              if (cell && cell.isCut) cutFillStyles.add(hexToRgba(cutColor, cell.opacity));
-            }
-          }
-          if (cutFillStyles.size) {
+          if (documentation.sectionCutFillGroups.length) {
             context.save();
-            for (const fillStyle of cutFillStyles) {
-              const loops = buildViewContoursFromGrid(renderGrid, (cell) => {
-                if (!cell || !cell.isCut) return false;
-                return hexToRgba(cutColor, cell.opacity) === fillStyle;
-              });
-              if (!loops.length) continue;
+            for (const group of documentation.sectionCutFillGroups) {
               context.beginPath();
-              for (const loop of loops) applyViewContourPath(context, loop);
-              context.fillStyle = fillStyle;
+              for (const loop of group.loops) applyViewContourPath(context, loop);
+              context.fillStyle = group.fillStyle;
               context.fill("evenodd");
             }
             context.restore();
@@ -6665,12 +7067,7 @@
         }
 
         // planeElevation and planHoleMask hoisted here so pass 2 outlines can use them
-        const planeElevation = isPlanLike
-          ? (sectionInfo && sectionInfo.type === "z"
-              ? snapViewElevationMeters(Number(sectionInfo.axis.elevation))
-              : build.planeElevation)
-          : null;
-        const planHoleMask = isPlanLike ? buildGroundHoleMaskFromGrid(renderGrid, 0) : null;
+        const planeElevation = documentation.planeElevation;
 
         // === Ground ===
         {
@@ -6683,10 +7080,7 @@
               -safeExt, undergroundStartRow,
               renderColumns + safeExt * 2, renderRows - undergroundStartRow + safeExt
             );
-            const holeLoops = buildViewContoursFromGrid(renderGrid, (cell, r, c) => {
-              return r >= undergroundStartRow && !!groundHoleMask[r] && groundHoleMask[r][c];
-            });
-            for (const loop of holeLoops) applyViewContourPath(context, loop);
+            for (const loop of documentation.groundHoleLoops) applyViewContourPath(context, loop);
             context.fillStyle = activeViewGroundColor();
             context.fill("evenodd");
             context.restore();
@@ -6697,10 +7091,7 @@
               context.save();
               context.beginPath();
               context.rect(-safeExt, -safeExt, renderColumns + safeExt * 2, renderRows + safeExt * 2);
-              const holeLoops = buildViewContoursFromGrid(renderGrid, (cell, r, c) =>
-                (!!planHoleMask[r] && planHoleMask[r][c]) || !!(cell && cell.depth > 0)
-              );
-              for (const loop of holeLoops) applyViewContourPath(context, loop);
+              for (const loop of documentation.planOverlayLoops) applyViewContourPath(context, loop);
               context.fillStyle = activeViewPlanGroundColor();
               context.fill("evenodd");
               context.restore();
@@ -6709,10 +7100,7 @@
               context.save();
               context.beginPath();
               context.rect(-safeExt, -safeExt, renderColumns + safeExt * 2, renderRows + safeExt * 2);
-              const holeLoops = buildViewContoursFromGrid(renderGrid, (cell, r, c) =>
-                (!!planHoleMask[r] && planHoleMask[r][c]) || !!(cell && cell.depth > 0)
-              );
-              for (const loop of holeLoops) applyViewContourPath(context, loop);
+              for (const loop of documentation.planOverlayLoops) applyViewContourPath(context, loop);
               context.fillStyle = activeViewPlanUndergroundColor();
               context.fill("evenodd");
               context.restore();
@@ -6727,18 +7115,7 @@
           context.strokeStyle = activeViewHorizonColor();
           context.lineWidth = px(horizonLineWidth);
           context.lineCap = "butt";
-
-          // Block intervals: columns where ground hole mask covers the zero-line row
-          const blockIntervals = [];
-          const checkRow = Math.min(renderRows - 1, undergroundStartRow);
-          if (checkRow >= 0 && checkRow < renderRows && groundHoleMask[checkRow]) {
-            let runStart = -1;
-            for (let c = 0; c <= renderColumns; c += 1) {
-              const blocked = c < renderColumns && groundHoleMask[checkRow][c];
-              if (blocked && runStart === -1) { runStart = c; continue; }
-              if (!blocked && runStart !== -1) { blockIntervals.push([runStart, c]); runStart = -1; }
-            }
-          }
+          const blockIntervals = documentation.horizonGapIntervals;
 
           const safeExt = Math.ceil(Math.max(surfaceWidth, surfaceHeight) / Math.max(1e-6, effectiveScale)) + 10;
           let cursorX = -safeExt;
@@ -6761,22 +7138,6 @@
           context.restore();
         }
 
-        // Visibility helper: a cell is "above ground" (not buried under the ground overlay).
-        // Used by Global Outline and per-layer outline pass 2.
-        const groundOverlayActive = !isPlanLike
-          ? state.viewEnvironment.groundEnabled
-          : (planeElevation >= 0 && state.viewEnvironment.planGroundEnabled) ||
-            (planeElevation < 0 && state.viewEnvironment.planUndergroundEnabled);
-        const isCellVisibleAfterGround = (r, c) => {
-          if (!groundOverlayActive) return true;
-          if (!isPlanLike) {
-            if (r < undergroundStartRow) return true;
-            return !!groundHoleMask[r] && groundHoleMask[r][c];
-          }
-          const planCell = renderGrid[r] ? renderGrid[r][c] : null;
-          return (!!planHoleMask[r] && planHoleMask[r][c]) || !!(planCell && planCell.depth > 0);
-        };
-
         // === Global outline (mass boundary + depth-transition lines) ===
         if (state.viewOutlineEffect.enabled) {
           context.save();
@@ -6784,12 +7145,9 @@
           const outlineColor = state.viewOutlineEffect.color;
 
           // Mass boundary: outer contour of all visible non-cut filled cells
-          const massLoops = buildViewContoursFromGrid(renderGrid, (cell, r, c) =>
-            !!cell && !cell.isCut && isCellVisibleAfterGround(r, c)
-          );
-          if (massLoops.length) {
+          if (documentation.globalMassLoops.length) {
             context.beginPath();
-            for (const loop of massLoops) applyViewContourPath(context, loop);
+            for (const loop of documentation.globalMassLoops) applyViewContourPath(context, loop);
             context.strokeStyle = outlineColor;
             context.lineWidth = px(outlineThickness);
             context.lineJoin = "miter";
@@ -6797,31 +7155,13 @@
           }
 
           // Depth transitions: segments where adjacent visible non-cut cells have different depth values
-          context.beginPath();
-          for (let r = 0; r < renderRows; r += 1) {
-            for (let c = 0; c < renderColumns; c += 1) {
-              const cell = renderGrid[r][c];
-              if (!cell || cell.isCut || !isCellVisibleAfterGround(r, c)) continue;
-              if (c + 1 < renderColumns) {
-                const right = renderGrid[r][c + 1];
-                if (right && !right.isCut && isCellVisibleAfterGround(r, c + 1) && right.depth !== cell.depth) {
-                  context.moveTo(c + 1, r);
-                  context.lineTo(c + 1, r + 1);
-                }
-              }
-              if (r + 1 < renderRows) {
-                const bottom = renderGrid[r + 1][c];
-                if (bottom && !bottom.isCut && isCellVisibleAfterGround(r + 1, c) && bottom.depth !== cell.depth) {
-                  context.moveTo(c, r + 1);
-                  context.lineTo(c + 1, r + 1);
-                }
-              }
-            }
+          if (documentation.globalDepthSegments.length) {
+            applyDocumentationSegmentsPath(context, documentation.globalDepthSegments);
+            context.strokeStyle = outlineColor;
+            context.lineWidth = px(outlineThickness);
+            context.lineCap = "square";
+            context.stroke();
           }
-          context.strokeStyle = outlineColor;
-          context.lineWidth = px(outlineThickness);
-          context.lineCap = "square";
-          context.stroke();
 
           context.restore();
         }
@@ -6830,11 +7170,10 @@
         if (state.viewSectionCutOutlineEffect.enabled) {
           const cutOutlineColor = state.viewSectionCutOutlineEffect.color || defaultViewSectionCutOutlineColor();
           const cutOutlineThickness = Math.max(1, Number(state.viewSectionCutOutlineEffect.thickness) || 1);
-          const cutLoops = buildViewContoursFromGrid(renderGrid, (cell) => !!cell && !!cell.isCut);
-          if (cutLoops.length) {
+          if (documentation.sectionCutOutlineLoops.length) {
             context.save();
             context.beginPath();
-            for (const loop of cutLoops) applyViewContourPath(context, loop);
+            for (const loop of documentation.sectionCutOutlineLoops) applyViewContourPath(context, loop);
             context.strokeStyle = cutOutlineColor;
             context.lineWidth = px(cutOutlineThickness);
             context.lineJoin = "miter";
@@ -6845,32 +7184,11 @@
 
         // === Per-layer outlines — pass 2: excluded-from-section-cut layers (on top of ground + section cut) ===
         {
-          const layerOutlineGroups = new Map();
-          for (let r = 0; r < renderRows; r += 1) {
-            for (let c = 0; c < renderColumns; c += 1) {
-              const cell = renderGrid[r][c];
-              if (!cell || !cell.forceOutline || !cell.excludedFromSectionCut) continue;
-              if (!isCellVisibleAfterGround(r, c)) continue;
-              const key = (cell.outlineColor || state.viewOutlineEffect.color) + ":" + (cell.outlineWidth || 1);
-              if (!layerOutlineGroups.has(key)) {
-                layerOutlineGroups.set(key, {
-                  color: cell.outlineColor || state.viewOutlineEffect.color,
-                  width: Math.max(1, Math.min(12, Math.round(Number(cell.outlineWidth) || 1))),
-                });
-              }
-            }
-          }
-          if (layerOutlineGroups.size) {
+          if (documentation.layerOutlinePass2.length) {
             context.save();
-            for (const [key, group] of layerOutlineGroups) {
-              const loops = buildViewContoursFromGrid(renderGrid, (cell, r, c) => {
-                if (!cell || !cell.forceOutline || !cell.excludedFromSectionCut) return false;
-                if ((cell.outlineColor || state.viewOutlineEffect.color) + ":" + (cell.outlineWidth || 1) !== key) return false;
-                return isCellVisibleAfterGround(r, c);
-              });
-              if (!loops.length) continue;
+            for (const group of documentation.layerOutlinePass2) {
               context.beginPath();
-              for (const loop of loops) applyViewContourPath(context, loop);
+              for (const loop of group.loops) applyViewContourPath(context, loop);
               context.strokeStyle = group.color;
               context.lineWidth = px(group.width);
               context.lineJoin = "miter";

@@ -177,7 +177,12 @@
 - `buildPlanOcclusionGrid(view)`: canonical grid για plan views
 - Debug: `DEBUG_VIEW_VECTOR_CONTOURS` (default off)
 - Current state: όταν ένα view intersect-άρει vector-bearing layers, τα canonical grids χτίζονται από shared derived layer geometry cache (`layerDerivedGeometryCache`) και legacy tiles συμμετέχουν μόνο ως compatibility content
+- Νέο runtime seam: per-view documentation geometry cache (`viewDocumentationGeometryCache`) πάνω από το canonical build
+  - resolved direction/section metadata + documentation-unit transforms
+  - projected documentation primitives από derived geometry + legacy compatibility tiles
+  - reusable visible loops, cut loops, outline segments, layer outline groups, ground/horizon helpers
+- Consumers: `renderDirectionalViewOutput` και `buildViewPaneDxfContent` διαβάζουν πλέον από το documentation seam αντί να ξαναχτίζουν ad-hoc contours/segments ανά caller
 - Derived geometry contents: adaptive sampled resolved layer surface + `opGroups` + connected `islands` + `silhouetteLoops` + horizontal/vertical run caches
 - Staged fallback: tile-only views συνεχίζουν να περνούν από το legacy cell/occlusion builder για safety/backwards compatibility
-- Current limitation: το documentation path είναι πλέον vector-derived αλλά όχι ακόμα fully analytic boolean/vector solids renderer, άρα εξακολουθεί να είναι sampled approximation και όχι exact curve boolean output
+- Current limitation: το documentation path έχει πλέον dedicated per-view vector entity seam, αλλά η visibility/occlusion solve παραμένει staged sampled approximation και όχι exact boolean curve output
 - Final target: professional-grade vector documentation outputs με continuous geometry, σωστά outlines, σωστές section cuts και depth/shadow behavior που παράγεται από vector truth και όχι από cell occupancy
