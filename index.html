@@ -3362,17 +3362,8 @@
           visible: layer.visible,
           opacity: layer.opacity,
           rotationQuarterTurns: layer.rotationQuarterTurns || 0,
-          cellCount: layer.cellCount,
-          tiles: [],
           vectorObjects: (layer.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean),
         };
-        Object.values(layer.tiles).forEach((tile) => {
-          snapshot.tiles.push({
-            tileX: tile.tileX,
-            tileY: tile.tileY,
-            pixels: Array.from(tile.pixels.entries()),
-          });
-        });
         return snapshot;
       }
 
@@ -3383,7 +3374,7 @@
         layer.visible = snapshot.visible;
         layer.opacity = snapshot.opacity;
         layer.rotationQuarterTurns = snapshot.rotationQuarterTurns || 0;
-        layer.cellCount = snapshot.cellCount || 0;
+        layer.cellCount = 0;
         layer.tiles = {};
         layer.vectorObjects = (snapshot.vectorObjects || [])
           .map(restoreVectorObjectFromSnapshot)
@@ -3391,11 +3382,6 @@
           .filter(Boolean);
         layer.tileRenderRevision = 0;
         layer.vectorRenderRevision = 0;
-        (snapshot.tiles || []).forEach((tileSnapshot) => {
-          const tile = createTile(layer, tileSnapshot.tileX, tileSnapshot.tileY);
-          tile.pixels = new Map(tileSnapshot.pixels || []);
-          tile.dirty = true;
-        });
         return layer;
       }
 
@@ -3801,7 +3787,7 @@
 
       async function captureProjectState() {
         return {
-          version: 1,
+          version: 2,
           exportedAt: new Date().toISOString(),
           theme: state.theme,
           viewport: {
@@ -4036,20 +4022,7 @@
           state.nextMeasurementNumber = Number.isFinite(project.nextMeasurementNumber) ? project.nextMeasurementNumber : 1;
           state.nextViewNumber = Number.isFinite(project.nextViewNumber) ? project.nextViewNumber : 1;
           state.scenes = restoredScenes;
-          if (project.drawings) {
-            state.drawings = project.drawings.map(restoreDrawingFromSnapshot);
-          } else {
-            // Backwards compat: old project format
-            const legacyDrawing = createDrawing("Drawing 1");
-            const legacyTransform = resolveDrawingDocumentTransform(legacyDrawing);
-            const layers = (project.layers || []).map((layerSnapshot) => restoreLayerFromSnapshot(layerSnapshot, legacyTransform));
-            const measurements = (project.measurements || []).map((measurementSnapshot) =>
-              restoreMeasurementFromSnapshot(measurementSnapshot, legacyTransform)
-            );
-            legacyDrawing.layers = layers.length ? layers : legacyDrawing.layers;
-            legacyDrawing.measurements = measurements;
-            state.drawings = [legacyDrawing];
-          }
+          state.drawings = Array.isArray(project.drawings) ? project.drawings.map(restoreDrawingFromSnapshot) : [];
           if (!state.drawings.length) state.drawings = [createDrawing("Drawing 1")];
           state.views = (project.views || []).map(restoreViewFromSnapshot);
 
@@ -4797,12 +4770,6 @@
 
       function layerRepresentativeColor(layer) {
         if (!layer) return DEFAULT_COLOR;
-        for (const tile of Object.values(layer.tiles || {})) {
-          const firstColor = tile?.pixels?.values?.().next?.();
-          if (firstColor && !firstColor.done && typeof firstColor.value === "string") {
-            return firstColor.value;
-          }
-        }
         const derivedGeometry = ensureLayerDerivedGeometry(layer, resolveLayerDocumentTransform(layer));
         if (derivedGeometry.styleGroups.length) {
           return derivedGeometry.styleGroups[0].color;
@@ -4914,31 +4881,12 @@
       }
 
       function layerRuntimeContentBoundsRect(layer) {
-        return combineWorldRects(layerTileWorldBoundsRect(layer), layerVectorContentBoundsRect(layer));
+        return layerVectorContentBoundsRect(layer);
       }
 
       function layerIntersectsView(layer, view) {
         if (!layer || !view || !view.bounds) return false;
-        const vectorRect = intersectWorldRects(layerVectorContentBoundsRect(layer), viewBoundsWorldRect(view));
-        if (vectorRect) return true;
-        const bounds = viewCellBounds(view.bounds);
-        if (!bounds || bounds.maxX < bounds.minX || bounds.maxY < bounds.minY) return false;
-        for (const tile of Object.values(layer.tiles)) {
-          const tileMinX = tile.tileX * TILE_SIZE;
-          const tileMinY = tile.tileY * TILE_SIZE;
-          const tileMaxX = tileMinX + TILE_SIZE - 1;
-          const tileMaxY = tileMinY + TILE_SIZE - 1;
-          if (tileMaxX < bounds.minX || tileMinX > bounds.maxX || tileMaxY < bounds.minY || tileMinY > bounds.maxY) continue;
-          for (const key of tile.pixels.keys()) {
-            const [localX, localY] = key.split(":").map(Number);
-            const cellX = tileMinX + localX;
-            const cellY = tileMinY + localY;
-            if (cellX >= bounds.minX && cellX <= bounds.maxX && cellY >= bounds.minY && cellY <= bounds.maxY) {
-              return true;
-            }
-          }
-        }
-        return false;
+        return !!intersectWorldRects(layerVectorContentBoundsRect(layer), viewBoundsWorldRect(view));
       }
 
       function intersectingLayersForView(view) {
@@ -5540,23 +5488,8 @@
         });
       }
 
-      function forEachLayerTileViewRect(layer, viewRect, callback) {
-        for (const tile of Object.values(layer.tiles || {})) {
-          const tileMinX = tile.tileX * TILE_SIZE;
-          const tileMinY = tile.tileY * TILE_SIZE;
-          for (const [key, color] of tile.pixels.entries()) {
-            const [localX, localY] = key.split(":").map(Number);
-            const cellRect = cellWorldRect(tileMinX + localX, tileMinY + localY);
-            const clippedRect = intersectWorldRects(cellRect, viewRect);
-            if (!clippedRect) continue;
-            callback(clippedRect, color);
-          }
-        }
-      }
-
       function forEachLayerViewRect(layer, orientation, viewRect, callback) {
         forEachLayerVectorViewRect(layer, orientation, viewRect, callback);
-        forEachLayerTileViewRect(layer, viewRect, callback);
       }
 
       function gridUnitsPerMeterForWorldUnitSize(unitWorldSize) {
@@ -5858,6 +5791,7 @@
             mirrorColumns: false,
           },
           contentMinProjectedColumn: minXUnits,
+          contentMinProjectedRow: minYUnits,
           contentMaxProjectedRow: maxYUnits,
           contentMaxZ: planeUnits,
           contentColumns: globalColumns,
@@ -5876,9 +5810,6 @@
         }
         const configuredLayers = orderedConfiguredLayersForView(view);
         if (!configuredLayers.length) return { error: "no-layers" };
-        if (!viewHasVectorRenderableLayers(configuredLayers)) {
-          return buildLegacyDirectionalOcclusionGrid(view, direction, options);
-        }
         return buildVectorDrivenDirectionalOcclusionGrid(view, direction, options, configuredLayers);
       }
 
@@ -5890,9 +5821,6 @@
         }
         const configuredLayers = orderedConfiguredLayersForView(view);
         if (!configuredLayers.length) return { error: "no-layers" };
-        if (!viewHasVectorRenderableLayers(configuredLayers)) {
-          return buildLegacyPlanOcclusionGrid(view, options);
-        }
         return buildVectorDrivenPlanOcclusionGrid(view, options, configuredLayers);
       }
 
@@ -5975,7 +5903,6 @@
             return [
               layer.id,
               scene.revisionKey,
-              layer.tileRenderRevision || 0,
               Math.max(0, Math.min(1, Number(layer.opacity) || 0)),
               snapViewElevationMeters(Number(config.baseElevation)),
               snapViewElevationMeters(Number(config.height), { allowNegative: false }),
@@ -6037,7 +5964,7 @@
         if (documentation?.isPlanLike) {
           return {
             x: (build.contentMinProjectedColumn + point.x) / unitsPerMeter,
-            y: (build.contentMaxProjectedRow - point.y) / unitsPerMeter,
+            y: ((Number.isFinite(build.contentMinProjectedRow) ? build.contentMinProjectedRow : build.contentMaxProjectedRow - build.totalRows) + point.y) / unitsPerMeter,
           };
         }
         return {
@@ -6064,7 +5991,7 @@
         if (request.isPlanLike) {
           return {
             x: worldX / unitWorldSize - build.contentMinProjectedColumn,
-            y: build.contentMaxProjectedRow - worldY / unitWorldSize,
+            y: worldY / unitWorldSize - (Number.isFinite(build.contentMinProjectedRow) ? build.contentMinProjectedRow : build.contentMaxProjectedRow - build.totalRows),
           };
         }
         return {
@@ -6205,20 +6132,50 @@
         };
       }
 
-      function documentationPrimitiveIntersectsGridCell(primitive, columnIndex, rowIndex) {
-        if (!primitive?.geometry) return false;
-        const minX = columnIndex;
-        const minY = rowIndex;
-        const maxX = columnIndex + 1;
-        const maxY = rowIndex + 1;
-        const samplePoints = [
-          { x: columnIndex + 0.5, y: rowIndex + 0.5 },
-          { x: columnIndex + 0.5, y: minY + 1e-4 },
-          { x: maxX - 1e-4, y: rowIndex + 0.5 },
-          { x: columnIndex + 0.5, y: maxY - 1e-4 },
-          { x: minX + 1e-4, y: rowIndex + 0.5 },
+      function documentationGridCellRect(columnIndex, rowIndex) {
+        return {
+          left: columnIndex,
+          top: rowIndex,
+          right: columnIndex + 1,
+          bottom: rowIndex + 1,
+        };
+      }
+
+      function documentationGridCellSamplePoints(cellRect) {
+        const inset = 1e-4;
+        const left = cellRect.left + inset;
+        const top = cellRect.top + inset;
+        const right = cellRect.right - inset;
+        const bottom = cellRect.bottom - inset;
+        const centerX = (cellRect.left + cellRect.right) / 2;
+        const centerY = (cellRect.top + cellRect.bottom) / 2;
+        return [
+          { x: centerX, y: centerY },
+          { x: left, y: top },
+          { x: centerX, y: top },
+          { x: right, y: top },
+          { x: right, y: centerY },
+          { x: right, y: bottom },
+          { x: centerX, y: bottom },
+          { x: left, y: bottom },
+          { x: left, y: centerY },
         ];
-        return samplePoints.some((point) => vectorGeometryFillContainsPoint(primitive.geometry, point.x, point.y));
+      }
+
+      function documentationGeometryIntersectsGridCell(geometry, columnIndex, rowIndex) {
+        if (!geometry) return false;
+        const cellRect = documentationGridCellRect(columnIndex, rowIndex);
+        const geometryBounds = documentationGeometryBoundsRect(geometry);
+        if (!geometryBounds || !documentationBoundsOverlap(geometryBounds, cellRect)) return false;
+        if (documentationGridCellSamplePoints(cellRect).some((point) => vectorGeometryFillContainsPoint(geometry, point.x, point.y))) {
+          return true;
+        }
+        const polylinePoints = documentationGeometryToPolylinePoints(geometry);
+        return polylinePoints.length >= 3 && polygonIntersectsRect(polylinePoints, cellRect);
+      }
+
+      function documentationPrimitiveIntersectsGridCell(primitive, columnIndex, rowIndex) {
+        return documentationGeometryIntersectsGridCell(primitive?.geometry, columnIndex, rowIndex);
       }
 
       function cloneDocumentationGrid(grid) {
@@ -6296,18 +6253,6 @@
           const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
           const topWorld = baseWorld + heightWorld;
           if (!(heightWorld > 0)) continue;
-
-          if (layerHasLegacyTileContent(layer)) {
-            forEachLayerTileViewRect(layer, viewRect, (rect) => {
-              const bounds = projectedResidualBounds(rect, baseWorld, topWorld);
-              if (!bounds) return;
-              residualBounds.push({
-                layerId: layer.id,
-                sourceKey: layer.id + ":tile:" + residualBounds.length,
-                bounds,
-              });
-            });
-          }
 
           const transform = resolveLayerDocumentTransform(layer);
           const scene = ensureLayerVectorScene(layer, transform);
@@ -6511,9 +6456,9 @@
         if (request.isPlanLike) {
           return {
             left: rect.left / unitWorldSize - build.contentMinProjectedColumn,
-            top: build.contentMaxProjectedRow - rect.bottom / unitWorldSize,
+            top: rect.top / unitWorldSize - (Number.isFinite(build.contentMinProjectedRow) ? build.contentMinProjectedRow : build.contentMaxProjectedRow - build.totalRows),
             right: rect.right / unitWorldSize - build.contentMinProjectedColumn,
-            bottom: build.contentMaxProjectedRow - rect.top / unitWorldSize,
+            bottom: rect.bottom / unitWorldSize - (Number.isFinite(build.contentMinProjectedRow) ? build.contentMinProjectedRow : build.contentMaxProjectedRow - build.totalRows),
           };
         }
         const directionConfig = build.directionConfig || directionalViewConfig(request.resolvedDirection);
@@ -8828,13 +8773,7 @@
         duplicate.visible = source.visible;
         duplicate.opacity = source.opacity;
         duplicate.rotationQuarterTurns = normalizedQuarterTurns(source.rotationQuarterTurns || 0);
-        duplicate.cellCount = source.cellCount;
         duplicate.vectorObjects = (source.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
-        Object.values(source.tiles).forEach((tile) => {
-          const nextTile = createTile(duplicate, tile.tileX, tile.tileY);
-          nextTile.pixels = new Map(tile.pixels);
-          nextTile.dirty = true;
-        });
         drawing.layers.splice(index, 0, duplicate);
         setActiveLayerById(duplicate.id, { tool: "select" });
         commitHistory("Duplicate Layer");
@@ -10274,42 +10213,17 @@
       }
 
       function layerWorldBoundsRect(layer) {
-        const cellBounds = layerCellBounds(layer);
-        const cellRect = cellBounds
-          ? {
-              left: cellBounds.minX * CELL_SIZE,
-              top: cellBounds.minY * CELL_SIZE,
-              right: (cellBounds.maxX + 1) * CELL_SIZE,
-              bottom: (cellBounds.maxY + 1) * CELL_SIZE,
-            }
-          : null;
-        return combineWorldRects(cellRect, layerVectorBoundsRect(layer));
+        return layerVectorBoundsRect(layer);
       }
 
       function collectLayerTransformSnapshot(layer) {
         return {
-          cells: collectLayerCells(layer),
+          cells: [],
           vectorObjects: collectLayerVectorObjects(layer),
         };
       }
 
       function layerTransformSnapshotBounds(snapshot) {
-        const cellRect = snapshot?.cells?.length
-          ? snapshot.cells.reduce(
-              (bounds, cell) => ({
-                left: Math.min(bounds.left, cell.x * CELL_SIZE),
-                top: Math.min(bounds.top, cell.y * CELL_SIZE),
-                right: Math.max(bounds.right, (cell.x + 1) * CELL_SIZE),
-                bottom: Math.max(bounds.bottom, (cell.y + 1) * CELL_SIZE),
-              }),
-              {
-                left: snapshot.cells[0].x * CELL_SIZE,
-                top: snapshot.cells[0].y * CELL_SIZE,
-                right: (snapshot.cells[0].x + 1) * CELL_SIZE,
-                bottom: (snapshot.cells[0].y + 1) * CELL_SIZE,
-              }
-            )
-          : null;
         const vectorRect = (snapshot?.vectorObjects || [])
           .map(vectorObjectBoundsRect)
           .filter(Boolean)
@@ -10317,7 +10231,7 @@
             if (!accumulator) return { ...rect };
             return combineWorldRects(accumulator, rect);
           }, null);
-        return combineWorldRects(cellRect, vectorRect);
+        return vectorRect;
       }
 
       function rotateWorldPointQuarterTurns(worldX, worldY, centerX, centerY, quarterTurns) {
@@ -10536,7 +10450,9 @@
 
       function applyLayerTransformSnapshot(layer, snapshot) {
         if (!layer) return false;
-        applyLayerCellSnapshot(layer, snapshot?.cells || [], 0, 0);
+        layer.tiles = {};
+        layer.cellCount = 0;
+        layer.tileRenderRevision = 0;
         applyLayerVectorSnapshot(layer, snapshot?.vectorObjects || []);
         return true;
       }
@@ -13713,13 +13629,7 @@
               dup.visible = l.visible;
               dup.opacity = l.opacity;
               dup.rotationQuarterTurns = l.rotationQuarterTurns || 0;
-              dup.cellCount = l.cellCount;
               dup.vectorObjects = (l.vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
-              Object.values(l.tiles).forEach((tile) => {
-                const nextTile = createTile(dup, tile.tileX, tile.tileY);
-                nextTile.pixels = new Map(tile.pixels);
-                nextTile.dirty = true;
-              });
               return dup;
             });
             clone.measurements = drawing.measurements.map((m) => {
@@ -13908,11 +13818,11 @@
 
             const meta = document.createElement("div");
             meta.className = "layer-meta";
-            meta.textContent = layer.cellCount + " cells";
+            meta.textContent = (layer.vectorObjects || []).length + " objects";
 
             const areaMeta = document.createElement("div");
             areaMeta.className = "layer-meta-secondary";
-            areaMeta.textContent = (layer.cellCount * 0.0025).toFixed(2) + " m²";
+            areaMeta.textContent = "Vector-authored layer";
 
             main.appendChild(header);
 
@@ -15133,15 +15043,8 @@
       }
 
       function scheduleChunkWarmup(delayMs = 90) {
+        void delayMs;
         cancelChunkWarmup();
-        state.chunkWarmup.signature = currentChunkWarmupSignature();
-        state.chunkWarmup.startTimer = window.setTimeout(() => {
-          state.chunkWarmup.startTimer = null;
-          if (state.chunkWarmup.signature !== currentChunkWarmupSignature()) return;
-          state.chunkWarmup.queue = collectVisibleChunkWarmupQueue();
-          if (!state.chunkWarmup.queue.length) return;
-          state.chunkWarmup.frame = window.requestAnimationFrame(processChunkWarmupFrame);
-        }, delayMs);
       }
 
       function tileSpansIntersect(a, b) {
@@ -15289,10 +15192,9 @@
       function rebuildCachedLayerComposite(cache, layer, width, height, bounds, tileSpan, signature) {
         const scene = ensureLayerVectorScene(layer);
         cache.context.clearRect(0, 0, width, height);
-        drawLayerTilesToContext(cache.context, layer, bounds, tileSpan);
         drawLayerVectorObjectsToContext(cache.context, layer, 0);
         cache.signature = signature;
-        cache.tileRenderRevision = layer.tileRenderRevision || 0;
+        cache.tileRenderRevision = 0;
         cache.vectorCount = scene.nodes.length;
         cache.vectorRenderRevision = scene.revisionKey;
       }
@@ -15301,12 +15203,10 @@
         const signature = layerViewportRenderSignature(width, height);
         const cache = ensureCachedLayerSurface(layer, width, height);
         const scene = ensureLayerVectorScene(layer);
-        const tileRevision = layer.tileRenderRevision || 0;
         const vectorCount = scene.nodes.length;
         const viewportChanged = cache.signature !== signature;
-        const tilesChanged = cache.tileRenderRevision !== tileRevision;
         const vectorChanged = cache.vectorRenderRevision !== scene.revisionKey;
-        const needsFullRebuild = viewportChanged || tilesChanged || vectorChanged || vectorCount < cache.vectorCount;
+        const needsFullRebuild = viewportChanged || vectorChanged || vectorCount < cache.vectorCount;
 
         if (needsFullRebuild) {
           rebuildCachedLayerComposite(cache, layer, width, height, bounds, tileSpan, signature);
@@ -15332,7 +15232,6 @@
 
       function drawLayerDirectToContent(layer, width, height, bounds, tileSpan) {
         const layerCtx = ensureLayerCompositeSurface(width, height);
-        drawLayerTilesToContext(layerCtx, layer, bounds, tileSpan);
         drawLayerVectorObjectsToContext(layerCtx, layer);
         contentCtx.save();
         contentCtx.globalAlpha = layer.opacity;
@@ -15343,40 +15242,18 @@
       function drawContentScene() {
         const width = ui.contentCanvas.clientWidth;
         const height = ui.contentCanvas.clientHeight;
-        const tileSpan = TILE_SIZE * CELL_SIZE * state.viewport.zoom;
-        const bounds = visibleTileBounds();
         const sceneState = ensureMainContentScene();
-        const displaySignature = currentMainContentDisplaySignature();
-        const needsFullRedraw =
-          mainContentRedrawPlannerState.forceFull ||
-          !mainContentRedrawPlannerState.initialized ||
-          mainContentRedrawPlannerState.signature !== displaySignature;
-
-        if (needsFullRedraw) {
-          contentCtx.clearRect(0, 0, width, height);
-          sceneState.paintEntries.forEach((entry) => {
-            const layer = entry.layer;
-            if (isLayerUnderLiveTransform(layer.id)) {
-              drawLayerDirectToContent(layer, width, height, bounds, tileSpan);
-              return;
-            }
-            drawLayerVisibleChunksToContent(layer, bounds, tileSpan);
-          });
-          clearMainContentPendingChunkKeys();
-        } else {
-          const dirtyRegions = collectVisibleDirtyContentRegions();
-          if (!dirtyRegions.length) {
-            mainContentRedrawPlannerState.signature = displaySignature;
-            mainContentRedrawPlannerState.initialized = true;
-            mainContentRedrawPlannerState.forceFull = false;
+        contentCtx.clearRect(0, 0, width, height);
+        sceneState.paintEntries.forEach((entry) => {
+          const layer = entry.layer;
+          if (isLayerUnderLiveTransform(layer.id)) {
+            drawLayerDirectToContent(layer, width, height, null, 0);
             return;
           }
-          dirtyRegions.forEach((region) => {
-            drawContentRegion(region, sceneState, width, height, tileSpan);
-          });
-        }
-
-        mainContentRedrawPlannerState.signature = displaySignature;
+          drawLayerCompositeToContent(layer, width, height, null, 0);
+        });
+        clearMainContentPendingChunkKeys();
+        mainContentRedrawPlannerState.signature = currentMainContentDisplaySignature();
         mainContentRedrawPlannerState.initialized = true;
         mainContentRedrawPlannerState.forceFull = false;
       }
@@ -15640,24 +15517,7 @@
       }
 
       function layerMatchesRect(layer, rect, containment) {
-        if (layerHasVectorMatch(layer, rect, containment)) return true;
-        let hasCells = false;
-        let intersects = false;
-        let fullyContained = true;
-        Object.values(layer.tiles).some((tile) => {
-          for (const key of tile.pixels.keys()) {
-            hasCells = true;
-            const [localX, localY] = key.split(":").map(Number);
-            const cellRect = cellWorldRect(tile.tileX * TILE_SIZE + localX, tile.tileY * TILE_SIZE + localY);
-            if (rectsIntersect(cellRect, rect)) intersects = true;
-            if (!rectContainsRect(rect, cellRect)) fullyContained = false;
-            if (intersects && !containment) return true;
-            if (!fullyContained && containment) return true;
-          }
-          return false;
-        });
-        if (!hasCells) return false;
-        return containment ? fullyContained : intersects;
+        return layerHasVectorMatch(layer, rect, containment);
       }
 
       function sceneMatchesRect(scene, rect, containment) {
@@ -16054,26 +15914,14 @@
         layer = layerEntry?.layer || layer;
         if (!layer || layer.visible === false || layerEntry?.visible === false) return null;
         const vectorColor = sampleVectorColorAt(layer, worldX, worldY);
-        if (vectorColor) {
-          return {
-            kind: "layer",
-            entry: layerEntry || null,
-            layer,
-            source: "vector",
-            color: vectorColor,
-            cell: null,
-          };
-        }
-        const cell = cellFromWorld(worldX, worldY);
-        const tileColor = getCellColor(layer, cell.x, cell.y);
-        if (!tileColor) return null;
+        if (!vectorColor) return null;
         return {
           kind: "layer",
           entry: layerEntry || null,
           layer,
-          source: "tile",
-          color: tileColor,
-          cell,
+          source: "vector",
+          color: vectorColor,
+          cell: null,
         };
       }
 

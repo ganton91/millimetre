@@ -78,16 +78,16 @@
 
 ## Renderer Architecture & Invariants
 
-**Canvas layers (κάτω → πάνω):** `staticCanvas` (grid/axes) → `sceneCanvas` (reference images) → `contentCanvas` (painted tiles) → `overlayCanvas` (brush ghost, selection highlight) + rulers ξεχωριστά
+**Canvas layers (κάτω → πάνω):** `staticCanvas` (grid/axes) → `sceneCanvas` (reference images) → `contentCanvas` (vector-derived layer composites) → `overlayCanvas` (brush ghost, selection highlight) + rulers ξεχωριστά
 
-**Data model:** Painted content ανά layer, κάθε layer σε tiles (`TILE_SIZE × TILE_SIZE`), κάθε tile έχει offscreen canvas + pixel map. Μόνο visible tiles ζωγραφίζονται.
+**Data model:** Layer content truth = drawing-local `vectorObjects`. Το `contentCanvas` δείχνει rasterized vector replay/cache, όχι tile storage truth.
 
 **Main-canvas truth split:** Για vector-first authoring, το renderer πρέπει να κρατά καθαρά ξεχωριστά επίπεδα:
 - `layer.vectorObjects` + measurement `points` / `lengths` / `areas` = document/history truth
 - retained vector scene ανά layer = runtime render/query truth σε world space
 - drawing-aware world scene graph = runtime container/query truth για drawings, layers, measurements
-- dirty-region redraw planner = main-canvas repaint planning πάνω από runtime invalidation signals
-- chunk/composite canvases = display cache μόνο
+- layer composite replay = main-canvas repaint path πάνω από runtime scene revisions
+- composite canvases = display cache μόνο
 
 **Product target rule:** Το Milimetre είναι measured infinite drawing canvas με τελικό σκοπό professional-grade documentation από τα `View Boxes`. Το vector migration του main canvas δεν είναι αυτοσκοπός· υπάρχει για να τροφοδοτήσει plan / elevation / section outputs με clean vector geometry, σωστά outlines και σωστή depth/shadow logic.
 
@@ -110,22 +110,16 @@
 - shared consumer 2 = future connected-shape selection / transform στο main canvas
 - derived/cache truth μόνο, ποτέ document/history rewrite
 
-**Legacy tile compatibility rule:** Όσο το legacy tile path παραμένει compatibility-only, επιτρέπεται να μείνει world-space display content κάτω από drawing-local vector/measurement authored paths, αρκεί να μη ξαναγίνει main-canvas display truth και να μη καθοδηγεί την αρχιτεκτονική.
+**Forward-only vector rule:** Το live runtime/render/view pipeline δεν κρατά πλέον legacy tile compatibility authority. Οτιδήποτε σχετίζεται με tiles/cells μπορεί να επιβιώνει μόνο σαν inert legacy codepath ή ignored import payload, όχι σαν active content truth.
 
-**Dirty invalidation direction:** Τα display caches δεν πρέπει να invalidated μαζικά μόνο από global revision mismatch. Το σωστό direction είναι:
-- per-layer vector dirty chunk spans σε world space από το retained scene
-- per-layer legacy tile dirty chunk keys για compatibility tile edits
-- main-canvas dirty-region planning που συγχωνεύει μόνο τα visible affected chunk spans σε redraw regions, μαζί με pending chunk redraws από background warmup
-- append-only delta όπου είναι ασφαλές και selective rebuild όπου υπάρχει rewrite/erase/transform impact
-
-**Tile seam fix:** Tiles ζωγραφίζονται από shared snapped tile boundaries (left/top = current boundary, right/bottom = next boundary) — όχι rounded shared tileSpan. `snapPixel()` είναι device-pixel aware: `Math.round(value * ratio) / ratio`.
+**Display cache rule:** Τα display caches πρέπει να παραμένουν cache μόνο. Το main canvas δουλεύει με per-layer viewport composite replay από retained vector scene και όχι με tile/chunk authority.
 
 **Sharpness:** `imageSmoothingEnabled` disabled όπου χρειάζεται. Pixel-snapped draw positions. Οποιαδήποτε επιστροφή σε blurred edges = regression.
 
 **Invariants (αμετάβλητα εκτός ρητής έγκρισης):**
 - Static / content / overlay rendering ξεχωριστά
 - Visible-area rendering (όχι global full-scene iteration)
-- Tile-based storage παραμένει (ή αντικαθίσταται μόνο από κάτι αυστηρά καλύτερο)
+- Layer content storage truth = drawing-local `vectorObjects`
 - Pointer interactions δεν trigger unnecessary UI rebuilds
 - Zoom/pan visually smooth, ruler math aligned με canvas world coordinates
 
@@ -187,10 +181,9 @@
   - analytic projected primitives παραμένουν authoritative όπου είναι locally safe
   - sampled loops/segments μένουν μόνο για incompatible/conflicted residual content
 - Derived geometry contents: adaptive sampled resolved layer surface + `opGroups` + connected `islands` + `silhouetteLoops` + horizontal/vertical run caches
-- Staged fallback: tile-only views συνεχίζουν να περνούν από το legacy cell/occlusion builder για safety/backwards compatibility
 - Current limitation:
   - το global all-or-nothing fallback ανά view έχει σπάσει, αλλά το exact boolean/vector solve δεν έχει ολοκληρωθεί ακόμη
-  - local sampled fallback παραμένει για `brushStroke`, `erase`, `style.noFill`, authoring outline mass, clipped geometry, projected overlap/depth conflicts, side section cuts και legacy compatibility tiles
+  - local sampled fallback παραμένει για `brushStroke`, `erase`, `style.noFill`, authoring outline mass, clipped geometry, projected overlap/depth conflicts και side section cuts
   - άρα analytic curves/shapes μπορούν πλέον να επιβιώνουν δίπλα σε incompatible residual content, αλλά όχι ακόμη μέσα στα unresolved local conflict zones
   - το τελικό ζητούμενο παραμένει exact boolean curve output, όχι μόνο staged authoritative analytic primitives + sampled residual fallback
 - Final target: professional-grade vector documentation outputs με continuous geometry, σωστά outlines, σωστές section cuts και depth/shadow behavior που παράγεται από vector truth και όχι από cell occupancy

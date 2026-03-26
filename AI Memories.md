@@ -129,34 +129,21 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 
 ### Main canvas — πρώτο vector render cutover
 
-- Το `drawContentScene()` δεν ζωγραφίζει πια κάθε layer κατευθείαν στο `contentCtx`
-- Κάθε layer περνά πρώτα από scratch composite surface:
-  - legacy tile render
-  - vector object render (`shape` + `brushStroke`)
-  - `compositeMode: "paint" | "erase"` με canvas compositing
-  - τελικό blit στο main `contentCtx` με το layer opacity
-- Αυτό έγινε για 2 λόγους:
-  - να αρχίσουν να φαίνονται τα νέα vector authoring operations στο main canvas
-  - να μη σπάσει το layer opacity όταν συνυπάρχουν paint + erase vector operations
-
-**Σημαντικός περιορισμός αυτού του σταδίου:** το legacy tile paint path παραμένει ακόμα ενεργό κάτω από το vector render. Άρα το σύστημα βρίσκεται σε hybrid φάση, όχι σε πλήρες vector-only cutover.
+- Το live `drawContentScene()` είναι πλέον vector-only main renderer
+- Κάθε layer περνά από per-layer viewport composite cache (`layerCompositeRenderCache`) που replay-άρει μόνο retained vector scene content
+- Το legacy tile render και το chunk warm-up/cache path βγήκαν από το active main-canvas draw authority
+- Άρα:
+  - document truth = drawing-local `layer.vectorObjects`
+  - render truth = retained world vector scene + layer composite replay
+  - display cache = raster cache μόνο, όχι semantic truth
 
 **Erase precision rule:** στο vector main-canvas render, τα erase objects δεν πρέπει να βασίζονται σε plain `destination-out`, γιατί το multiplicative alpha αφήνει fringes στα anti-aliased όρια. Το erase pass γίνεται με προσωρινό vector mask surface και exact alpha subtract πάνω στο layer composite, ώστε ίδιο paint / ίδιο erase να ακυρώνονται χωρίς επιστροφή σε per-cell rendering.
 
 **Erase performance rule:** το subtractive erase δεν πρέπει να κάνει `getImageData` / `putImageData` σε όλο το layer canvas για κάθε erase object, γιατί το κόστος κλιμακώνεται με το πλήθος των erase operations και προκαλεί lag. Το pixel subtract πρέπει να περιορίζεται στο ελάχιστο screen-space bounding rect του συγκεκριμένου vector object.
 
-**Vector op compositing rule:** το main canvas vector pass έχει αρχίσει να ενοποιείται σε shared per-object op surface για `paint` και `erase`. Και τα δύο modes rasterize-άρουν πρώτα το ίδιο vector coverage σε temporary surface· μετά το `paint` κάνει bounded blit στο layer composite ενώ το `erase` κάνει bounded alpha subtract. Το legacy tile render παραμένει από κάτω για compatibility.
+**Vector op compositing rule:** το main canvas vector pass ενοποιείται σε shared per-object op surface για `paint` και `erase`. Και τα δύο modes rasterize-άρουν πρώτα το ίδιο vector coverage σε temporary surface· μετά το `paint` κάνει bounded blit στο layer composite ενώ το `erase` κάνει bounded alpha subtract.
 
-**Layer composite cache rule:** το main content render μπορεί να κρατά per-layer screen-space composite cache για το τρέχον viewport signature (`width/height/x/y/zoom`) και να εφαρμόζει incremental vector replay μόνο για newly appended vector objects. Αν αλλάξει viewport, αν αλλάξουν legacy tiles, ή αν γίνει history rewind/restore, το layer composite πρέπει να ξαναχτίζεται πλήρως.
-
-**Chunked vector cache direction:** για να μη βαραίνει το pan/zoom μετά από πολλά vector erase ops, το main content render μπορεί να μετατοπίζεται από ενιαίο viewport cache σε chunked per-layer cache πάνω στο world tile grid (`TILE_SIZE` chunks). Σε αυτή την κατεύθυνση:
-- γίνονται reuse μόνο τα ορατά chunks στο ίδιο zoom
-- νέα vector ops εφαρμόζονται incrementally μόνο στα chunks που τέμνουν το object bounds
-- zoom navigation δεν πρέπει να πετάει μαζικά τα cached chunks σε κάθε wheel step, γιατί αυτό επαναφέρει το lag. Τα chunks μπορούν να reused/scaled προσωρινά στο zoom/pan και να ξαναχτίζονται lazily σε επόμενο edit ή σε πραγματικό invalidation (tile/history changes).
-
-**Post-zoom warmup rule:** αν το zoom navigation reuse-άρει προσωρινά chunks από προηγούμενο zoom level για ομαλό wheel interaction, πρέπει να υπάρχει lazy background warm-up των visible chunks αφού η κίνηση σταθεροποιηθεί. Στόχος: να μη φορτώνεται το πρώτο `paint/erase` μετά το zoom με το κόστος του πρώτου rebuild.
-
-**Warmup repaint rule:** όταν το background warm-up ξαναχτίζει visible chunks στο νέο zoom level, πρέπει να ζητά και content repaint. Αλλιώς στην οθόνη μένουν stale scaled chunks και εμφανίζονται zoom artifacts/fringes παρότι το cache έχει ήδη διορθωθεί στο background.
+**Layer composite cache rule:** το main content render κρατά per-layer screen-space composite cache για το τρέχον viewport signature (`width/height/x/y/zoom`) και μπορεί να κάνει incremental replay μόνο για newly appended vector objects. Αν αλλάξει viewport ή αν γίνει history rewind/restore/transform rewrite, το layer composite ξαναχτίζεται πλήρως.
 
 
 ### Authoring cutover — νέα actions σε vector-only path
@@ -184,15 +171,14 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - authored bounds
   - expanded bounds για stroke-aware rasterization
   - chunk span πάνω στο world tile grid
-- Το main-canvas chunk render, τα layer vector bounds και τα basic vector hit/read paths διαβάζουν πλέον από αυτό το retained scene — όχι κατευθείαν από το raw `layer.vectorObjects` array
+- Τα layer vector bounds, τα basic vector hit/read paths και το main-canvas vector replay διαβάζουν πλέον από αυτό το retained scene — όχι κατευθείαν από το raw `layer.vectorObjects` array
 - Τα display caches είναι πλέον ρητά ξεχωριστά:
   - `layerCompositeRenderCache`
-  - `layerChunkRenderCache`
 - Άρα το τωρινό architecture seam είναι:
-  - `document drawing-local vectorObjects/measurements -> retained world vector scene + scene-backed local runtime content -> drawing-aware world scene graph -> dirty-region redraw planner -> raster display cache`
+  - `document drawing-local vectorObjects/measurements -> retained world vector scene + scene-backed local runtime content -> drawing-aware world scene graph -> layer composite replay -> raster display cache`
 - Αυτό είναι transitional step προς serious vector renderer. Δεν αλλάζει το grid-snapped vector model και δεν επιτρέπει επιστροφή σε per-cell main rendering.
 
-### Drawing-aware world scene graph + dirty-region redraw planner
+### Drawing-aware world scene graph + layer composite replay
 
 - Υπάρχει πλέον explicit runtime world scene graph (`mainContentSceneState`) για το main canvas:
   - `drawingNodes` ως retained container nodes
@@ -215,23 +201,10 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - κάθε `layer` entry κρατά και runtime-local vector scene χτισμένο απευθείας από το authored document truth
   - κάθε `measurement` entry κρατά authored-local snapshot + local bounds χτισμένα απευθείας από το measurement document truth
   - τα vector render/query paths δουλεύουν σε world projection, ενώ τα measurement/vector authoring and transform paths δουλεύουν στο ίδιο drawing-local model
-- Το draw / warmup / top-layer hit path δεν χρειάζεται πια να ξανασυνθέτει ad-hoc layer order από raw loops κάθε φορά
+- Το draw / top-layer hit path δεν χρειάζεται πια να ξανασυνθέτει ad-hoc layer order από raw loops κάθε φορά
 - Τα βασικά measurement/layer query paths πατάνε πλέον σε graph child entries αντί για raw `getAll…()` + `findDrawingFor…()` scans σε κάθε pass
-- Κάθε retained layer scene κρατά και:
-  - `rasterBounds`
-  - `dirtyChunkKeys`
-  - `updateMode: "append" | "rebuild"`
-- Τα vector invalidations σημαδεύουν πλέον world-tile chunk spans, όχι implicit full visible-chunk rebuild από revision mismatch
-- Τα legacy tile edits σημαδεύουν ξεχωριστά per-layer dirty chunk keys στο runtime chunk cache, ώστε το compatibility tile path να μπαίνει στον ίδιο redraw planner χωρίς να ξαναγυρνά το main canvas σε per-cell rendering
-- Τα legacy tiles παραμένουν ακόμη world-space compatibility content:
-  - δεν έχουν local-space runtime projection όπως τα vectors/measurements
-  - άρα το drawing-local authored cut έχει ολοκληρωθεί για vector/measurement path, όχι ακόμα για το legacy tile path
-- Append-only vector changes μπορούν να κάνουν incremental chunk delta μόνο στα dirty chunks
-- Replace/rewrite vector changes γυρίζουν deterministically σε chunk rebuild μόνο όπου υπάρχει dirty span
-- Το main canvas content repaint δεν κάνει πια υποχρεωτικά full visible-chunk traversal σε κάθε `contentDirty`:
-  - αν αλλάξει viewport / canvas size / scene structure / layer opacity signature → full redraw
-  - αλλιώς ο planner μαζεύει τα visible dirty chunk keys, τα warmup-ready pending chunk redraws, τα συγχωνεύει σε redraw regions και ξαναζωγραφίζει μόνο αυτά τα regions
-- Αν δεν υπάρχει visible dirty region, το content pass μπορεί να γίνει no-op και να κρατήσει το υπάρχον raster display cache ως έχει
+- Κάθε retained layer scene κρατά ακόμη `rasterBounds`, `dirtyChunkKeys`, `updateMode: "append" | "rebuild"` σαν runtime metadata seam, αλλά αυτά δεν είναι πια main-canvas draw authority
+- Το active main-canvas content repaint είναι full viewport layer-composite replay driven από scene revisions και viewport signature, όχι legacy tile/chunk planner
 - Το authored-local cut πλέον ζει στο document/history model:
   - νέα και restored vector/measurement δεδομένα αποθηκεύονται drawing-local
   - restore/import/history restore κανονικοποιούν deterministic legacy world-authored content σε drawing-local truth
@@ -244,9 +217,8 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - horizontal/vertical run caches για reusable projection/query consumers
   - stroke-level undo/redo history παραμένει ανέγγιχτο· τα derived islands είναι μόνο runtime geometry
 - Πρώτος consumer του seam είναι πλέον το view/documentation pipeline:
-  - `buildDirectionalOcclusionGrid` / `buildPlanOcclusionGrid` κάνουν dispatch σε hybrid vector-driven builders όταν το intersecting view content έχει vectors
-  - source truth για αυτά τα views = derived vector geometry + legacy tiles ως compatibility content, όχι raw tile grid μόνο
-  - tile-only views παραμένουν προσωρινά στο legacy cell/occlusion builder για staged safety
+  - `buildDirectionalOcclusionGrid` / `buildPlanOcclusionGrid` τρέχουν πλέον μόνο vector-driven builders
+  - source truth για αυτά τα views = derived vector geometry μόνο, όχι raw tile grid
   - pane export/PDF/DXF metrics δουλεύουν πλέον σε generic view-grid units, όχι hardcoded 1 unit = 1 cell
 - Πάνω από το shared derived geometry seam υπάρχει πλέον και runtime-only per-view documentation geometry seam (`viewDocumentationGeometryCache`):
   - cache per view + direction/section πάνω από το current hybrid occlusion build
@@ -262,7 +234,6 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - και οι δύο διαβάζουν πλέον shared prebuilt documentation geometry και κάνουν mixed resolve:
     - analytic projected primitives όπου είναι locally safe
     - sampled residual loops/segments μόνο για το incompatible/conflicted remainder
-- Η ένταξη του legacy tile compatibility path στο ίδιο drawing container model παραμένει follow-up compatibility cut, όχι το αμέσως επόμενο βήμα
 - Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
 
 ### Product target — documentation-first vector engine
@@ -273,9 +244,8 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - σωστό authored truth
   - σωστό retained scene/runtime truth
   - και αργότερα σωστό view projection truth
-- Τα views δεν είναι πια pure cell/occlusion-grid driven όταν υπάρχει vector content:
-  - vector-bearing layers περνούν από derived geometry cache σε adaptive sampled view grids
-  - legacy tile-only views μένουν προσωρινά στο παλιό builder για compatibility
+- Τα views δεν είναι πια pure cell/occlusion-grid driven:
+  - όλα τα active view builds περνούν από derived vector geometry cache σε adaptive sampled view grids
 - Το documentation path έχει πλέον δικό του reusable runtime seam:
   - authoritative analytic projected vector primitives για locally safe filled shape cases
   - sampled residual documentation loops/segments πάνω από το shared derived geometry για incompatible/conflicted content
@@ -284,7 +254,7 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 - Σημερινός περιορισμός του documentation path:
   - το documentation seam δεν είναι πια global all-or-nothing ανά view· το fallback σπάει πλέον local/per-entity
   - authoritative analytic branch: pure-filled `shape` objects που είναι locally safe μέσα στο current view solve
-  - local sampled fallback παραμένει για: `brushStroke`, `erase`, `style.noFill`, authoring outline mass (`outlineWidthCells > 0`), clipped geometry στα όρια του view, projected overlap/depth conflict, side section cuts και legacy tile compatibility content
+  - local sampled fallback παραμένει για: `brushStroke`, `erase`, `style.noFill`, authoring outline mass (`outlineWidthCells > 0`), clipped geometry στα όρια του view, projected overlap/depth conflict και side section cuts
   - `Plan` / `Z sections` και safe non-section side elevations μπορούν πλέον να κρατούν analytic curves/shapes ακόμα κι όταν αλλού στο ίδιο view υπάρχει incompatible residual content
   - το final target παραμένει exact boolean/vector documentation output, όχι μόνο staged analytic islands πάνω από sampled residual solve
 
@@ -299,18 +269,12 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - brush stamps
 - Το `layerMatchesRect` κάνει πλέον και basic vector-aware matching για marquee selection
 
-**Περιορισμός αυτού του σταδίου:** το vector hit model είναι intentionally basic και δεν λύνει ακόμα όλα τα σύνθετα cases (π.χ. πλήρες boolean resolve πάνω από legacy tile content ή ακριβές transform handles για vector-only layers).
+**Περιορισμός αυτού του σταδίου:** το vector hit model είναι intentionally basic και δεν λύνει ακόμα όλα τα σύνθετα cases (π.χ. πλήρες boolean resolve για documentation conflicts ή ακριβές transform handles για connected derived shapes).
 
-### Layer transforms — mixed tile + vector path
+### Layer transforms — vector-only document path
 
-- Τα layer transforms δεν πρέπει να βασίζονται μόνο σε `collectLayerCells()` / `applyLayerCellSnapshot()`
-- Το transform truth ενός layer είναι πλέον mixed snapshot:
-  - `cells`
-  - `vectorObjects`
-- `Move`, `Rotate` (quarter turns) και `Flip` πρέπει να εφαρμόζονται και στα `vectorObjects`, όχι μόνο στα legacy tiles
-- Τα layer handles / selection bounds πρέπει να βασίζονται σε combined world bounds από:
-  - legacy cell content
-  - vector object bounds
+- Τα layer transforms πατάνε πλέον σε vector snapshot truth (`vectorObjects`) και όχι σε mixed tile/vector document model
+- `Move`, `Rotate` (quarter turns) και `Flip` εφαρμόζονται στα `vectorObjects` και τα handles / selection bounds διαβάζουν από vector world bounds
 - Κατά τη διάρκεια live layer move/rotate interaction, ο active layer μπορεί να ζωγραφίζεται direct στο main content pass αντί να περιμένει chunk-cache reuse, ώστε το drag να μην μπλοκάρεται από cache invalidation
 
 ---
