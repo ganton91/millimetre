@@ -5688,6 +5688,10 @@
         return {
           directionConfig,
           contentMinProjectedColumn: contentMinProjectedColumn - horizontalOffset,
+          contentMinProjectedColumnRaw: contentMinProjectedColumn,
+          contentHorizontalOffset: horizontalOffset,
+          viewPrimaryMinUnits,
+          viewPrimaryColumnCount: totalColumns,
           contentMaxZ: contentMaxZUnits,
           contentColumns,
           totalRows,
@@ -5958,6 +5962,27 @@
         return WORLD_UNITS_PER_METER / Math.max(1e-9, gridUnitsPerMeter);
       }
 
+      function documentationProjectDirectionalPrimaryCoordinate(primaryWorld, build) {
+        const unitWorldSize = documentationUnitWorldSize(build);
+        const viewPrimaryMinUnits = Number.isFinite(build?.viewPrimaryMinUnits) ? build.viewPrimaryMinUnits : 0;
+        const viewPrimaryColumnCount = Number.isFinite(build?.viewPrimaryColumnCount) ? build.viewPrimaryColumnCount : 0;
+        const contentMinProjectedColumnRaw = Number.isFinite(build?.contentMinProjectedColumnRaw)
+          ? build.contentMinProjectedColumnRaw
+          : Number(build?.contentMinProjectedColumn) || 0;
+        const contentHorizontalOffset = Number.isFinite(build?.contentHorizontalOffset) ? build.contentHorizontalOffset : 0;
+        const rawPrimaryUnits = primaryWorld / unitWorldSize - viewPrimaryMinUnits;
+        const projectedPrimaryUnits = build?.directionConfig?.mirrorColumns
+          ? viewPrimaryColumnCount - rawPrimaryUnits
+          : rawPrimaryUnits;
+        return projectedPrimaryUnits - contentMinProjectedColumnRaw + contentHorizontalOffset;
+      }
+
+      function documentationProjectDirectionalPrimaryInterval(minPrimaryWorld, maxPrimaryWorld, build) {
+        const start = documentationProjectDirectionalPrimaryCoordinate(minPrimaryWorld, build);
+        const end = documentationProjectDirectionalPrimaryCoordinate(maxPrimaryWorld, build);
+        return [Math.min(start, end), Math.max(start, end)];
+      }
+
       function documentationPointToMeters(point, documentation) {
         const build = documentation?.build || {};
         const unitsPerMeter = build.gridUnitsPerMeter || CELLS_PER_METER;
@@ -6082,12 +6107,13 @@
         const minPrimary = Math.min(interval[0], interval[1]);
         const maxPrimary = Math.max(interval[0], interval[1]);
         if (!(maxPrimary > minPrimary) || !(topWorld > baseWorld)) return null;
+        const [docLeft, docRight] = documentationProjectDirectionalPrimaryInterval(minPrimary, maxPrimary, build);
         return {
           type: "rect",
           bounds: {
-            minX: minPrimary / unitWorldSize - build.contentMinProjectedColumn,
+            minX: docLeft,
             minY: build.contentMaxZ - topWorld / unitWorldSize,
-            maxX: maxPrimary / unitWorldSize - build.contentMinProjectedColumn,
+            maxX: docRight,
             maxY: build.contentMaxZ - baseWorld / unitWorldSize,
           },
         };
@@ -6466,10 +6492,11 @@
         const primaryMaxWorld = directionConfig.primaryAxis === "x" ? rect.right : rect.bottom;
         const depthMinWorld = directionConfig.depthAxis === "x" ? rect.left : rect.top;
         const depthMaxWorld = directionConfig.depthAxis === "x" ? rect.right : rect.bottom;
+        const [docLeft, docRight] = documentationProjectDirectionalPrimaryInterval(primaryMinWorld, primaryMaxWorld, build);
         return {
-          left: primaryMinWorld / unitWorldSize - build.contentMinProjectedColumn,
+          left: docLeft,
           top: build.contentMaxZ - topWorld / unitWorldSize,
-          right: primaryMaxWorld / unitWorldSize - build.contentMinProjectedColumn,
+          right: docRight,
           bottom: build.contentMaxZ - baseWorld / unitWorldSize,
           depthMin: depthMinWorld / unitWorldSize,
           depthMax: depthMaxWorld / unitWorldSize,
