@@ -4365,6 +4365,10 @@
         if (!state.isPopoutWindow || !snapshot) return;
         state.history.isRestoring = true;
         try {
+          invalidateMainContentRedraw();
+          invalidateMainContentSceneStructure();
+          cancelChunkWarmup();
+          clearMainContentPendingChunkKeys();
           if (snapshot.theme === "dark" || snapshot.theme === "light") {
             state.theme = snapshot.theme;
           }
