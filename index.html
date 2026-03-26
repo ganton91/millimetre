@@ -2974,6 +2974,16 @@
         layerEntriesById: new Map(),
         measurementEntriesById: new Map(),
       };
+      function invalidateMainContentSceneStructure() {
+        mainContentSceneState.structureSignature = "";
+        mainContentSceneState.drawingNodes = [];
+        mainContentSceneState.topEntries = [];
+        mainContentSceneState.paintEntries = [];
+        mainContentSceneState.topMeasurementEntries = [];
+        mainContentSceneState.paintMeasurementEntries = [];
+        mainContentSceneState.layerEntriesById = new Map();
+        mainContentSceneState.measurementEntriesById = new Map();
+      }
       const mainContentRedrawPlannerState = {
         signature: "",
         initialized: false,
@@ -3359,15 +3369,19 @@
         return snapshot;
       }
 
-      function restoreLayerFromSnapshot(snapshot) {
+      function restoreLayerFromSnapshot(snapshot, drawingTransform = null) {
         const layer = createLayer(snapshot.name);
+        const authoredTransform = drawingTransform || resolveDrawingDocumentTransform(null);
         layer.id = snapshot.id;
         layer.visible = snapshot.visible;
         layer.opacity = snapshot.opacity;
         layer.rotationQuarterTurns = snapshot.rotationQuarterTurns || 0;
         layer.cellCount = snapshot.cellCount || 0;
         layer.tiles = {};
-        layer.vectorObjects = (snapshot.vectorObjects || []).map(restoreVectorObjectFromSnapshot).filter(Boolean);
+        layer.vectorObjects = (snapshot.vectorObjects || [])
+          .map(restoreVectorObjectFromSnapshot)
+          .map((vectorObject) => normalizeVectorObjectToDrawingLocal(vectorObject, authoredTransform))
+          .filter(Boolean);
         layer.tileRenderRevision = 0;
         layer.vectorRenderRevision = 0;
         (snapshot.tiles || []).forEach((tileSnapshot) => {
@@ -3401,8 +3415,9 @@
         };
       }
 
-      function restoreMeasurementFromSnapshot(snapshot) {
+      function restoreMeasurementFromSnapshot(snapshot, drawingTransform = null) {
         const measurement = createMeasurement(snapshot.name);
+        const authoredTransform = drawingTransform || resolveDrawingDocumentTransform(null);
         measurement.id = snapshot.id;
         measurement.visible = snapshot.visible;
         measurement.opacity = snapshot.opacity;
@@ -3410,17 +3425,40 @@
         measurement.defaultColor = snapshot.defaultColor;
         measurement.mode = snapshot.mode;
         measurement.rotationQuarterTurns = snapshot.rotationQuarterTurns || 0;
-        measurement.points = (snapshot.points || []).map((point) => ({ ...point }));
+        measurement.points = (snapshot.points || []).map((point) => normalizeMeasurementPointToDrawingLocal(point, authoredTransform));
         measurement.lengths = (snapshot.lengths || []).map((length) => ({
           ...length,
-          start: { ...length.start },
-          end: { ...length.end },
+          start: normalizeMeasurementVertexToDrawingLocal(length.start, authoredTransform),
+          end: normalizeMeasurementVertexToDrawingLocal(length.end, authoredTransform),
+          meters: measurementLengthMeters(
+            normalizeMeasurementVertexToDrawingLocal(length.start, authoredTransform),
+            normalizeMeasurementVertexToDrawingLocal(length.end, authoredTransform)
+          ),
         }));
         measurement.areas = (snapshot.areas || []).map((area) => ({
           ...area,
-          points: area.points.map((point) => ({ ...point })),
+          points: area.points.map((point) => normalizeMeasurementVertexToDrawingLocal(point, authoredTransform)),
+          squareMeters: measurementAreaSquareMeters(
+            area.points.map((point) => normalizeMeasurementVertexToDrawingLocal(point, authoredTransform))
+          ),
         }));
         return measurement;
+      }
+
+      function restoreDrawingFromSnapshot(snapshot) {
+        const drawing = createDrawing(snapshot?.name || "Drawing 1");
+        drawing.id = snapshot?.id || drawing.id;
+        drawing.name = snapshot?.name || drawing.name;
+        drawing.visible = snapshot?.visible !== false;
+        drawing.rotation = snapshot?.rotation || 0;
+        drawing.anchor = snapshot?.anchor || { x: 0, y: 0 };
+        const transform = resolveDrawingDocumentTransform(drawing);
+        drawing.layers = (snapshot?.layers || []).map((layerSnapshot) => restoreLayerFromSnapshot(layerSnapshot, transform));
+        if (!drawing.layers.length) drawing.layers = [createLayer("Layer 1")];
+        drawing.measurements = (snapshot?.measurements || []).map((measurementSnapshot) =>
+          restoreMeasurementFromSnapshot(measurementSnapshot, transform)
+        );
+        return drawing;
       }
 
       function cloneViewForSnapshot(view) {
@@ -3491,6 +3529,7 @@
             measurements: d.measurements.map(cloneMeasurementForSnapshot),
           })),
           views: state.views.map(cloneViewForSnapshot),
+          activeDrawingId: state.activeDrawingId,
           activeSceneId: state.activeSceneId,
           activeMeasurementId: state.activeMeasurementId,
           activeMeasurementItem: state.activeMeasurementItem ? { ...state.activeMeasurementItem } : null,
@@ -3503,6 +3542,7 @@
       function snapshotActiveContextSignature(snapshot) {
         if (!snapshot) return "";
         return JSON.stringify({
+          activeDrawingId: snapshot.activeDrawingId || null,
           activeSceneId: snapshot.activeSceneId || null,
           activeMeasurementId: snapshot.activeMeasurementId || null,
           activeMeasurementItem: snapshot.activeMeasurementItem || null,
@@ -3635,54 +3675,59 @@
 
       function restoreDocumentState(snapshot) {
         state.history.isRestoring = true;
-        invalidateMainContentRedraw();
-        closeModal(ui.settingsMenu);
-        closeModal(ui.sceneScaleModal);
-        closeModal(ui.viewPropertiesModal);
-        if (state.viewEditDraft) {
-          closeViewEditModal();
+        try {
+          invalidateMainContentRedraw();
+          invalidateMainContentSceneStructure();
+          cancelChunkWarmup();
+          clearMainContentPendingChunkKeys();
+          closeModal(ui.settingsMenu);
+          closeModal(ui.sceneScaleModal);
+          closeModal(ui.viewPropertiesModal);
+          if (state.viewEditDraft) {
+            closeViewEditModal();
+          }
+          state.sceneCalibration = null;
+          state.interaction = null;
+          state.selectionPicker = null;
+          state.pendingViewCreation = null;
+          state.measurementDraft = null;
+          state.measurementAreaClickMemory = null;
+          state.measurementSelectClickMemory = null;
+          state.shapeDraft = null;
+          state.polygonClickMemory = null;
+          state.renameSession = null;
+          state.eyedropperSession = null;
+          state.color.eyedropper = false;
+          state.outline.eyedropper = false;
+          state.nextSceneNumber = snapshot.nextSceneNumber;
+          state.nextMeasurementNumber = snapshot.nextMeasurementNumber;
+          state.nextViewNumber = snapshot.nextViewNumber;
+          state.scenes = snapshot.scenes.map((scene) => ({ ...scene }));
+          state.drawings = (snapshot.drawings || []).map(restoreDrawingFromSnapshot);
+          if (!state.drawings.length) state.drawings = [createDrawing("Drawing 1")];
+          state.views = snapshot.views.map((viewSnapshot) => restoreViewFromSnapshot(viewSnapshot));
+          state.activeDrawingId = state.drawings.some((drawing) => drawing.id === snapshot.activeDrawingId) ? snapshot.activeDrawingId : null;
+          state.activeSceneId = state.scenes.some((scene) => scene.id === snapshot.activeSceneId) ? snapshot.activeSceneId : null;
+          state.activeMeasurementId = getAllMeasurements().some((m) => m.id === snapshot.activeMeasurementId)
+            ? snapshot.activeMeasurementId
+            : null;
+          state.activeMeasurementItem = state.activeMeasurementId && snapshot.activeMeasurementItem
+            ? { ...snapshot.activeMeasurementItem }
+            : null;
+          state.activeViewId = state.views.some((view) => view.id === snapshot.activeViewId) ? snapshot.activeViewId : null;
+          state.activeLayerId = getAllLayers().some((l) => l.id === snapshot.activeLayerId)
+            ? snapshot.activeLayerId
+            : null;
+          if (!state.activeDrawingId) {
+            state.activeDrawingId =
+              (state.activeLayerId && findDrawingForLayer(state.activeLayerId)?.id) ||
+              (state.activeMeasurementId && findDrawingForMeasurement(state.activeMeasurementId)?.id) ||
+              null;
+          }
+          state.activeTool = snapshot.activeTool;
+        } finally {
+          state.history.isRestoring = false;
         }
-        state.sceneCalibration = null;
-        state.interaction = null;
-        state.selectionPicker = null;
-        state.pendingViewCreation = null;
-        state.measurementDraft = null;
-        state.measurementAreaClickMemory = null;
-        state.measurementSelectClickMemory = null;
-        state.shapeDraft = null;
-        state.polygonClickMemory = null;
-        state.renameSession = null;
-        state.eyedropperSession = null;
-        state.color.eyedropper = false;
-        state.outline.eyedropper = false;
-        state.nextSceneNumber = snapshot.nextSceneNumber;
-        state.nextMeasurementNumber = snapshot.nextMeasurementNumber;
-        state.nextViewNumber = snapshot.nextViewNumber;
-        state.scenes = snapshot.scenes.map((scene) => ({ ...scene }));
-        state.drawings = (snapshot.drawings || []).map((d) => ({
-          id: d.id,
-          name: d.name,
-          visible: d.visible !== false,
-          rotation: d.rotation || 0,
-          anchor: d.anchor || { x: 0, y: 0 },
-          layers: (d.layers || []).map(restoreLayerFromSnapshot),
-          measurements: (d.measurements || []).map(restoreMeasurementFromSnapshot),
-        }));
-        if (!state.drawings.length) state.drawings = [createDrawing("Drawing 1")];
-        state.views = snapshot.views.map((viewSnapshot) => restoreViewFromSnapshot(viewSnapshot));
-        state.activeSceneId = state.scenes.some((scene) => scene.id === snapshot.activeSceneId) ? snapshot.activeSceneId : null;
-        state.activeMeasurementId = getAllMeasurements().some((m) => m.id === snapshot.activeMeasurementId)
-          ? snapshot.activeMeasurementId
-          : null;
-        state.activeMeasurementItem = state.activeMeasurementId && snapshot.activeMeasurementItem
-          ? { ...snapshot.activeMeasurementItem }
-          : null;
-        state.activeViewId = state.views.some((view) => view.id === snapshot.activeViewId) ? snapshot.activeViewId : null;
-        state.activeLayerId = getAllLayers().some((l) => l.id === snapshot.activeLayerId)
-          ? snapshot.activeLayerId
-          : null;
-        state.activeTool = snapshot.activeTool;
-        state.history.isRestoring = false;
         render({ ui: true, static: true, scenes: true, content: true, overlay: true, rulers: true });
       }
 
@@ -3693,6 +3738,7 @@
         const previous = state.history.undoStack[state.history.undoStack.length - 1];
         if (!previous) return false;
         restoreDocumentState(previous.snapshot);
+        flushScheduledRenderNow();
         requestPopoutSync();
         return true;
       }
@@ -3702,6 +3748,7 @@
         if (!next) return false;
         state.history.undoStack.push(next);
         restoreDocumentState(next.snapshot);
+        flushScheduledRenderNow();
         requestPopoutSync();
         return true;
       }
@@ -3806,6 +3853,7 @@
             "4": [...state.viewPaneDirectionsByLayout["4"]],
           },
           activeTool: state.activeTool === "eyedropper" ? state.eyedropperSession?.previousTool || "select" : state.activeTool,
+          activeDrawingId: state.activeDrawingId,
           activeSceneId: state.activeSceneId,
           activeLayerId: state.activeLayerId,
           activeMeasurementId: state.activeMeasurementId,
@@ -3857,6 +3905,9 @@
       async function restoreProjectState(project) {
         state.history.isRestoring = true;
         invalidateMainContentRedraw();
+        invalidateMainContentSceneStructure();
+        cancelChunkWarmup();
+        clearMainContentPendingChunkKeys();
         try {
           closeModal(ui.settingsMenu);
           closeModal(ui.sceneScaleModal);
@@ -3979,20 +4030,15 @@
           state.nextViewNumber = Number.isFinite(project.nextViewNumber) ? project.nextViewNumber : 1;
           state.scenes = restoredScenes;
           if (project.drawings) {
-            state.drawings = project.drawings.map((d) => ({
-              id: d.id,
-              name: d.name,
-              visible: d.visible !== false,
-              rotation: d.rotation || 0,
-              anchor: d.anchor || { x: 0, y: 0 },
-              layers: (d.layers || []).map(restoreLayerFromSnapshot),
-              measurements: (d.measurements || []).map(restoreMeasurementFromSnapshot),
-            }));
+            state.drawings = project.drawings.map(restoreDrawingFromSnapshot);
           } else {
             // Backwards compat: old project format
-            const layers = (project.layers || []).map(restoreLayerFromSnapshot);
-            const measurements = (project.measurements || []).map(restoreMeasurementFromSnapshot);
             const legacyDrawing = createDrawing("Drawing 1");
+            const legacyTransform = resolveDrawingDocumentTransform(legacyDrawing);
+            const layers = (project.layers || []).map((layerSnapshot) => restoreLayerFromSnapshot(layerSnapshot, legacyTransform));
+            const measurements = (project.measurements || []).map((measurementSnapshot) =>
+              restoreMeasurementFromSnapshot(measurementSnapshot, legacyTransform)
+            );
             legacyDrawing.layers = layers.length ? layers : legacyDrawing.layers;
             legacyDrawing.measurements = measurements;
             state.drawings = [legacyDrawing];
@@ -4043,6 +4089,7 @@
             ? project.shape.type
             : "rect";
 
+          state.activeDrawingId = state.drawings.some((drawing) => drawing.id === project.activeDrawingId) ? project.activeDrawingId : null;
           state.activeSceneId = state.scenes.some((scene) => scene.id === project.activeSceneId) ? project.activeSceneId : null;
           state.activeLayerId = getAllLayers().some((l) => l.id === project.activeLayerId) ? project.activeLayerId : null;
           state.activeMeasurementId = getAllMeasurements().some((m) => m.id === project.activeMeasurementId)
@@ -4052,6 +4099,12 @@
             ? { ...project.activeMeasurementItem }
             : null;
           state.activeViewId = state.views.some((view) => view.id === project.activeViewId) ? project.activeViewId : null;
+          if (!state.activeDrawingId) {
+            state.activeDrawingId =
+              (state.activeLayerId && findDrawingForLayer(state.activeLayerId)?.id) ||
+              (state.activeMeasurementId && findDrawingForMeasurement(state.activeMeasurementId)?.id) ||
+              null;
+          }
           state.activeCanvasViewTab =
             project.activeCanvasViewTab === "main" || state.views.some((view) => view.id === project.activeCanvasViewTab)
               ? project.activeCanvasViewTab
@@ -4378,15 +4431,7 @@
                 : state.viewEnvironment.planUndergroundColor;
           }
           if (Array.isArray(snapshot.drawings)) {
-            state.drawings = snapshot.drawings.map((d) => ({
-              id: d.id,
-              name: d.name,
-              visible: d.visible !== false,
-              rotation: d.rotation || 0,
-              anchor: d.anchor || { x: 0, y: 0 },
-              layers: (d.layers || []).map(restoreLayerFromSnapshot),
-              measurements: (d.measurements || []).map(restoreMeasurementFromSnapshot),
-            }));
+            state.drawings = snapshot.drawings.map(restoreDrawingFromSnapshot);
             if (!state.drawings.length) state.drawings = [createDrawing("Drawing 1")];
           }
           if (Array.isArray(snapshot.views)) {
@@ -7196,6 +7241,16 @@
         };
       }
 
+      function drawingLocalCellFromWorld(transform, worldX, worldY) {
+        const localPoint = transform ? drawingWorldPointToLocal(transform, worldX, worldY) : { x: worldX, y: worldY };
+        return cellFromWorld(localPoint.x, localPoint.y);
+      }
+
+      function drawingLocalCellCenterWorld(cell, transform) {
+        const localPoint = cellPointToWorldPoint(cell);
+        return transform ? drawingLocalPointToWorld(transform, localPoint.x, localPoint.y) : localPoint;
+      }
+
       function brushOriginFromCell(cellX, cellY) {
         return {
           x: cellX - Math.floor((state.brush.width - 1) / 2),
@@ -7549,9 +7604,10 @@
 
       function applyLayerVectorSnapshot(layer, vectorObjects) {
         if (!layer) return false;
-        const previousScene = ensureLayerVectorScene(layer);
+        const layerTransform = resolveLayerDocumentTransform(layer);
+        const previousScene = ensureLayerVectorScene(layer, layerTransform);
         const previousRasterBounds = previousScene.rasterBounds ? { ...previousScene.rasterBounds } : null;
-        const nextRasterBounds = vectorObjectsRasterBounds(vectorObjects);
+        const nextRasterBounds = vectorObjectsWorldRasterBounds(vectorObjects, layerTransform);
         layer.vectorObjects = (vectorObjects || []).map(cloneVectorObjectForSnapshot).filter(Boolean);
         bumpLayerVectorRevision(layer);
         markLayerVectorSceneDirty(layer, previousRasterBounds, nextRasterBounds);
@@ -7643,6 +7699,8 @@
       function createLayerVectorScene() {
         return {
           sourceRevision: -1,
+          sourceTransformSignature: "",
+          revisionKey: "",
           objectCount: 0,
           updateMode: "steady",
           nodes: [],
@@ -7717,7 +7775,7 @@
         }
       }
 
-      function rebuildLayerVectorScene(scene, layer) {
+      function rebuildLayerVectorScene(scene, layer, transform = null) {
         scene.nodes = [];
         scene.paintNodeIndices = [];
         scene.authoredBounds = null;
@@ -7726,10 +7784,12 @@
         scene.chunkIndex = new Map();
         const vectorObjects = layer?.vectorObjects || [];
         vectorObjects.forEach((vectorObject, index) => {
-          appendLayerVectorSceneNode(scene, vectorObject, index);
+          appendLayerVectorSceneNode(scene, projectVectorObjectToWorldRuntime(vectorObject, transform), index);
         });
         scene.objectCount = vectorObjects.length;
         scene.sourceRevision = layer?.vectorRenderRevision || 0;
+        scene.sourceTransformSignature = transform?.signature || "";
+        scene.revisionKey = [scene.sourceRevision, scene.sourceTransformSignature].join("|");
         scene.updateMode = "rebuild";
         return scene;
       }
@@ -7743,42 +7803,49 @@
         return true;
       }
 
-      function ensureLayerVectorScene(layer) {
+      function ensureLayerVectorScene(layer, transform = null) {
         if (!layer || typeof layer !== "object") return createLayerVectorScene();
         let scene = layerVectorSceneCache.get(layer);
         if (!scene) {
           scene = createLayerVectorScene();
           layerVectorSceneCache.set(layer, scene);
         }
+        const resolvedTransform = transform || resolveLayerDocumentTransform(layer);
         const sourceRevision = layer?.vectorRenderRevision || 0;
+        const transformSignature = resolvedTransform?.signature || "";
         const vectorObjects = layer?.vectorObjects || [];
         const objectCount = vectorObjects.length;
 
         if (objectCount < scene.objectCount) {
-          return rebuildLayerVectorScene(scene, layer);
+          return rebuildLayerVectorScene(scene, layer, resolvedTransform);
         }
 
-        if (scene.sourceRevision !== sourceRevision) {
-          if (objectCount > scene.objectCount && layerVectorSceneCanAppend(scene, layer)) {
+        if (scene.sourceRevision !== sourceRevision || scene.sourceTransformSignature !== transformSignature) {
+          const transformChanged = scene.sourceTransformSignature !== transformSignature;
+          if (!transformChanged && objectCount > scene.objectCount && layerVectorSceneCanAppend(scene, layer)) {
             for (let index = scene.objectCount; index < objectCount; index += 1) {
-              appendLayerVectorSceneNode(scene, vectorObjects[index], index);
+              appendLayerVectorSceneNode(scene, projectVectorObjectToWorldRuntime(vectorObjects[index], resolvedTransform), index);
             }
             scene.objectCount = objectCount;
             scene.sourceRevision = sourceRevision;
+            scene.sourceTransformSignature = transformSignature;
+            scene.revisionKey = [scene.sourceRevision, scene.sourceTransformSignature].join("|");
             scene.updateMode = "append";
             return scene;
           }
-          return rebuildLayerVectorScene(scene, layer);
+          return rebuildLayerVectorScene(scene, layer, resolvedTransform);
         }
 
         if (objectCount > scene.objectCount) {
           if (!layerVectorSceneCanAppend(scene, layer)) {
-            return rebuildLayerVectorScene(scene, layer);
+            return rebuildLayerVectorScene(scene, layer, resolvedTransform);
           }
           for (let index = scene.objectCount; index < objectCount; index += 1) {
-            appendLayerVectorSceneNode(scene, vectorObjects[index], index);
+            appendLayerVectorSceneNode(scene, projectVectorObjectToWorldRuntime(vectorObjects[index], resolvedTransform), index);
           }
           scene.objectCount = objectCount;
+          scene.sourceTransformSignature = transformSignature;
+          scene.revisionKey = [scene.sourceRevision, scene.sourceTransformSignature].join("|");
           scene.updateMode = "append";
         }
 
@@ -7852,6 +7919,16 @@
         }, null);
       }
 
+      function vectorObjectWorldRasterBounds(vectorObject, transform) {
+        return expandedVectorObjectBoundsRect(projectVectorObjectToWorldRuntime(vectorObject, transform));
+      }
+
+      function vectorObjectsWorldRasterBounds(vectorObjects, transform) {
+        return (vectorObjects || []).reduce((accumulator, vectorObject) => {
+          return combineWorldRects(accumulator, vectorObjectWorldRasterBounds(vectorObject, transform));
+        }, null);
+      }
+
       function normalizeDrawingTransformAnchor(anchor) {
         return {
           x: Number.isFinite(anchor?.x) ? Number(anchor.x) : 0,
@@ -7873,6 +7950,28 @@
           mode: "container-local",
           signature: [rotation, anchor.x, anchor.y].join("|"),
         };
+      }
+
+      function resolveDrawingDocumentTransform(drawing) {
+        return createDrawingWorldTransform(drawing || null);
+      }
+
+      function resolveLayerDocumentTransform(layerOrEntry) {
+        const entry = resolveLayerSceneEntry(layerOrEntry);
+        if (entry?.transform) return entry.transform;
+        const layer = entry?.layer || layerOrEntry;
+        const layerId = typeof layer === "string" ? layer : layer?.id;
+        const drawing = state.drawings.find((candidate) => candidate.layers.some((item) => item.id === layerId)) || null;
+        return resolveDrawingDocumentTransform(drawing);
+      }
+
+      function resolveMeasurementDocumentTransform(measurementOrEntry) {
+        const entry = resolveMeasurementSceneEntry(measurementOrEntry);
+        if (entry?.transform) return entry.transform;
+        const measurement = entry?.measurement || measurementOrEntry;
+        const measurementId = typeof measurement === "string" ? measurement : measurement?.id;
+        const drawing = state.drawings.find((candidate) => candidate.measurements.some((item) => item.id === measurementId)) || null;
+        return resolveDrawingDocumentTransform(drawing);
       }
 
       function drawingWorldPointToLocal(transform, worldX, worldY) {
@@ -7954,6 +8053,10 @@
         };
       }
 
+      function vectorObjectAuthoringSpace(vectorObject) {
+        return vectorObject?.space === "drawing-local" ? "drawing-local" : "world";
+      }
+
       function mapVectorGeometryToDrawingLocalRuntime(geometry, transform) {
         if (!geometry || typeof geometry !== "object") return geometry;
         const inverseRotation = normalizeAngle(-(transform?.angle || 0));
@@ -7966,6 +8069,20 @@
           return geometry.type === "rect"
             ? createOrientedRectGeometry(localCenter, width, height, inverseRotation)
             : createOrientedEllipseGeometry(localCenter, width / 2, height / 2, inverseRotation);
+        }
+        if (geometry.type === "orientedRect") {
+          return {
+            ...geometry,
+            center: drawingWorldPointToLocal(transform, geometry.center.x, geometry.center.y),
+            rotation: normalizeAngle((geometry.rotation || 0) + inverseRotation),
+          };
+        }
+        if (geometry.type === "orientedEllipse") {
+          return {
+            ...geometry,
+            center: drawingWorldPointToLocal(transform, geometry.center.x, geometry.center.y),
+            rotation: normalizeAngle((geometry.rotation || 0) + inverseRotation),
+          };
         }
         if (geometry.type === "circle") {
           return {
@@ -7982,9 +8099,54 @@
         return clonePlainData(geometry);
       }
 
+      function mapVectorGeometryToWorldRuntime(geometry, transform) {
+        if (!geometry || typeof geometry !== "object") return geometry;
+        const worldRotation = transform?.angle || 0;
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          const bounds = geometry.bounds;
+          if (!bounds) return clonePlainData(geometry);
+          const localCenterX = (bounds.minX + bounds.maxX) / 2;
+          const localCenterY = (bounds.minY + bounds.maxY) / 2;
+          const worldCenter = drawingLocalPointToWorld(transform, localCenterX, localCenterY);
+          const width = bounds.maxX - bounds.minX;
+          const height = bounds.maxY - bounds.minY;
+          return geometry.type === "rect"
+            ? createOrientedRectGeometry(worldCenter, width, height, worldRotation)
+            : createOrientedEllipseGeometry(worldCenter, width / 2, height / 2, worldRotation);
+        }
+        if (geometry.type === "orientedRect") {
+          return {
+            ...geometry,
+            center: drawingLocalPointToWorld(transform, geometry.center.x, geometry.center.y),
+            rotation: normalizeAngle((geometry.rotation || 0) + worldRotation),
+          };
+        }
+        if (geometry.type === "orientedEllipse") {
+          return {
+            ...geometry,
+            center: drawingLocalPointToWorld(transform, geometry.center.x, geometry.center.y),
+            rotation: normalizeAngle((geometry.rotation || 0) + worldRotation),
+          };
+        }
+        if (geometry.type === "circle") {
+          return {
+            ...geometry,
+            center: drawingLocalPointToWorld(transform, geometry.center.x, geometry.center.y),
+          };
+        }
+        if (geometry.type === "polygon") {
+          return {
+            ...geometry,
+            points: geometry.points.map((point) => drawingLocalPointToWorld(transform, point.x, point.y)),
+          };
+        }
+        return clonePlainData(geometry);
+      }
+
       function mapVectorObjectToDrawingLocalRuntime(vectorObject, transform) {
         const clone = cloneVectorObjectForSnapshot(vectorObject);
         if (!clone) return null;
+        if (vectorObjectAuthoringSpace(clone) === "drawing-local") return clone;
         if (clone.kind === "brushStroke" && Array.isArray(clone.stamps)) {
           clone.stamps = clone.stamps.map((stamp) => {
             const stampGeometry =
@@ -8007,23 +8169,60 @@
         if (clone.geometry) {
           clone.geometry = mapVectorGeometryToDrawingLocalRuntime(clone.geometry, transform);
         }
+        clone.space = "drawing-local";
         return clone;
       }
 
-      function createDrawingLocalVectorScene(worldScene, transform) {
+      function normalizeVectorObjectToDrawingLocal(vectorObject, transform = null) {
+        return mapVectorObjectToDrawingLocalRuntime(
+          vectorObject,
+          transform || resolveDrawingDocumentTransform(null)
+        );
+      }
+
+      function projectVectorObjectToWorldRuntime(vectorObject, transform) {
+        const clone = cloneVectorObjectForSnapshot(vectorObject);
+        if (!clone) return null;
+        if (vectorObjectAuthoringSpace(clone) !== "drawing-local") return clone;
+        if (clone.kind === "brushStroke" && Array.isArray(clone.stamps)) {
+          clone.stamps = clone.stamps.map((stamp) => {
+            const stampGeometry =
+              stamp?.geometry ||
+              (stamp?.bounds
+                ? {
+                    type: clone.brushShape === "circle" ? "ellipse" : "rect",
+                    bounds: stamp.bounds,
+                  }
+                : null);
+            return stampGeometry
+              ? {
+                  ...stamp,
+                  bounds: undefined,
+                  geometry: mapVectorGeometryToWorldRuntime(stampGeometry, transform),
+                }
+              : { ...stamp };
+          });
+        }
+        if (clone.geometry) {
+          clone.geometry = mapVectorGeometryToWorldRuntime(clone.geometry, transform);
+        }
+        delete clone.space;
+        return clone;
+      }
+
+      function createDrawingLocalVectorScene(layer, transform) {
         const localScene = createLayerVectorScene();
-        localScene.sourceRevision = worldScene?.sourceRevision || 0;
-        localScene.objectCount = worldScene?.objectCount || 0;
-        localScene.updateMode = worldScene?.updateMode || "steady";
+        localScene.sourceRevision = layer?.vectorRenderRevision || 0;
+        localScene.sourceTransformSignature = transform?.signature || "";
+        localScene.revisionKey = [localScene.sourceRevision, localScene.sourceTransformSignature].join("|");
+        localScene.objectCount = (layer?.vectorObjects || []).length;
+        localScene.updateMode = "rebuild";
         localScene.transformSignature = transform?.signature || "";
-        (worldScene?.nodes || []).forEach((worldNode, index) => {
-          const localVectorObject = mapVectorObjectToDrawingLocalRuntime(worldNode.vectorObject, transform);
-          const localNode = createLayerVectorSceneNode(localVectorObject, worldNode.order);
+        ((layer?.vectorObjects) || []).forEach((vectorObject, index) => {
+          const localVectorObject = mapVectorObjectToDrawingLocalRuntime(vectorObject, transform);
+          const localNode = createLayerVectorSceneNode(localVectorObject, index);
           if (!localNode) return;
-          localNode.id = worldNode.id;
-          localNode.sourceRef = worldNode.sourceRef;
-          localNode.compositeMode = worldNode.compositeMode;
-          localNode.worldChunkSpan = worldNode.chunkSpan ? { ...worldNode.chunkSpan } : null;
+          localNode.sourceRef = vectorObject;
           localScene.nodes.push(localNode);
           localScene.authoredBounds = combineWorldRects(localScene.authoredBounds, localNode.authoredBounds);
           localScene.rasterBounds = combineWorldRects(localScene.rasterBounds, localNode.expandedBounds || localNode.authoredBounds);
@@ -8035,49 +8234,31 @@
         return localScene;
       }
 
-      function createDrawingLocalMeasurementPoint(point, transform) {
-        const worldPoint = measurementPointWorld(point);
-        const localPoint = drawingWorldPointToLocal(transform, worldPoint.x, worldPoint.y);
-        return {
-          id: point.id,
-          x: localPoint.x,
-          y: localPoint.y,
-          color: point.color,
-          space: "drawing-local",
-        };
-      }
-
-      function createDrawingLocalMeasurementVertex(point, transform) {
-        const localPoint = drawingWorldPointToLocal(transform, point.x, point.y);
-        return {
-          x: localPoint.x,
-          y: localPoint.y,
-          space: "drawing-local",
-        };
-      }
-
       function createDrawingLocalMeasurementSnapshot(measurement, transform) {
         if (!measurement) return null;
         return {
-          points: measurement.points.map((point) => createDrawingLocalMeasurementPoint(point, transform)),
+          points: measurement.points.map((point) => normalizeMeasurementPointToDrawingLocal(point, transform)),
           lengths: measurement.lengths.map((length) => ({
             ...length,
-            start: createDrawingLocalMeasurementVertex(length.start, transform),
-            end: createDrawingLocalMeasurementVertex(length.end, transform),
+            start: normalizeMeasurementVertexToDrawingLocal(length.start, transform),
+            end: normalizeMeasurementVertexToDrawingLocal(length.end, transform),
           })),
           areas: measurement.areas.map((area) => ({
             ...area,
-            points: area.points.map((point) => createDrawingLocalMeasurementVertex(point, transform)),
+            points: area.points.map((point) => normalizeMeasurementVertexToDrawingLocal(point, transform)),
           })),
         };
       }
 
       function syncLayerSceneRuntimeContent(entry) {
-        const worldScene = ensureLayerVectorScene(entry.layer);
+        const worldScene = ensureLayerVectorScene(entry.layer, entry.transform);
         entry.vectorScene = worldScene;
-        const runtimeSignature = [worldScene.sourceRevision, entry.transform?.signature || ""].join("|");
+        const runtimeSignature = [
+          entry.layer?.vectorRenderRevision || 0,
+          entry.transform?.signature || "",
+        ].join("|");
         if (entry.runtimeVectorSceneSignature !== runtimeSignature) {
-          entry.runtimeVectorScene = createDrawingLocalVectorScene(worldScene, entry.transform);
+          entry.runtimeVectorScene = createDrawingLocalVectorScene(entry.layer, entry.transform);
           entry.runtimeVectorSceneSignature = runtimeSignature;
         }
         return entry.runtimeVectorScene || worldScene;
@@ -8092,7 +8273,7 @@
       function resolveLayerRuntimeVectorPair(layerOrEntry) {
         const entry = resolveLayerSceneEntry(layerOrEntry);
         const layer = entry?.layer || layerOrEntry;
-        const worldScene = ensureLayerVectorScene(layer);
+        const worldScene = ensureLayerVectorScene(layer, entry?.transform || null);
         if (!entry) {
           return {
             entry: null,
@@ -8145,7 +8326,7 @@
           layerId: layer.id,
           visible: drawingNode.visible && layer?.visible !== false,
           transform: drawingNode.transform,
-          vectorScene: ensureLayerVectorScene(layer),
+          vectorScene: ensureLayerVectorScene(layer, drawingNode.transform),
           runtimeVectorScene: null,
           runtimeVectorSceneSignature: "",
         };
@@ -8186,7 +8367,7 @@
             entry.parent = drawingNode;
             entry.visible = drawingNode.visible && entry.layer?.visible !== false;
             entry.transform = drawingNode.transform;
-            entry.vectorScene = ensureLayerVectorScene(entry.layer);
+            entry.vectorScene = ensureLayerVectorScene(entry.layer, entry.transform);
             syncLayerSceneRuntimeContent(entry);
             drawingNode.children.push(entry);
             mainContentSceneState.layerEntriesById.set(entry.layerId, entry);
@@ -8219,6 +8400,9 @@
             [
               drawing.id,
               drawing.visible === false ? 0 : 1,
+              drawing.rotation || 0,
+              Number.isFinite(drawing.anchor?.x) ? drawing.anchor.x : 0,
+              Number.isFinite(drawing.anchor?.y) ? drawing.anchor.y : 0,
               drawing.layers.map((layer) => [layer.id, layer.visible === false ? 0 : 1].join(":")).join(","),
               drawing.measurements.map((measurement) => [measurement.id, measurement.visible === false ? 0 : 1].join(":")).join(","),
             ].join("|")
@@ -8785,22 +8969,76 @@
         return Math.round(value / step) * step;
       }
 
-      function measurementPointFromWorld(worldPoint, sourcePoint = {}) {
-        const snappedX = snapMeasurementCoordinate(worldPoint.x);
-        const snappedY = snapMeasurementCoordinate(worldPoint.y);
+      function measurementPointAuthoringSpace(point) {
+        return point?.space === "drawing-local" ? "drawing-local" : "world";
+      }
+
+      function measurementPointCoordinates(point) {
+        if (!point) return { x: 0, y: 0 };
+        if (typeof point.x === "number" && typeof point.y === "number") {
+          return {
+            x: point.x,
+            y: point.y,
+          };
+        }
         return {
-          id: sourcePoint.id || "point-" + Math.random().toString(36).slice(2, 9),
-          cellX: Math.round(snappedX / CELL_SIZE - 0.5),
-          cellY: Math.round(snappedY / CELL_SIZE - 0.5),
-          color: sourcePoint.color || state.color.active,
+          x: (Number(point.cellX) + 0.5) * CELL_SIZE,
+          y: (Number(point.cellY) + 0.5) * CELL_SIZE,
         };
       }
 
-      function measurementVertexPointFromWorld(worldPoint) {
-        return {
-          x: snapMeasurementCoordinate(worldPoint.x),
-          y: snapMeasurementCoordinate(worldPoint.y),
+      function measurementPointFromCoordinates(sourcePoint, coordinates, forceSpace = null) {
+        const snappedX = snapMeasurementCoordinate(coordinates.x);
+        const snappedY = snapMeasurementCoordinate(coordinates.y);
+        const point = {
+          id: sourcePoint?.id || "point-" + Math.random().toString(36).slice(2, 9),
+          x: snappedX,
+          y: snappedY,
+          color: sourcePoint?.color || state.color.active,
         };
+        if ((forceSpace || measurementPointAuthoringSpace(sourcePoint)) === "drawing-local") {
+          point.space = "drawing-local";
+        }
+        return point;
+      }
+
+      function measurementVertexFromCoordinates(sourcePoint, coordinates, forceSpace = null) {
+        const vertex = {
+          x: snapMeasurementCoordinate(coordinates.x),
+          y: snapMeasurementCoordinate(coordinates.y),
+        };
+        if ((forceSpace || measurementPointAuthoringSpace(sourcePoint)) === "drawing-local") {
+          vertex.space = "drawing-local";
+        }
+        return vertex;
+      }
+
+      function normalizeMeasurementPointToDrawingLocal(point, transform) {
+        if (measurementPointAuthoringSpace(point) === "drawing-local") {
+          return measurementPointFromCoordinates(point, measurementPointCoordinates(point), "drawing-local");
+        }
+        const worldPoint = measurementPointCoordinates(point);
+        const localPoint = drawingWorldPointToLocal(transform, worldPoint.x, worldPoint.y);
+        return measurementPointFromCoordinates(point, localPoint, "drawing-local");
+      }
+
+      function normalizeMeasurementVertexToDrawingLocal(point, transform) {
+        if (measurementPointAuthoringSpace(point) === "drawing-local") {
+          return measurementVertexFromCoordinates(point, measurementPointCoordinates(point), "drawing-local");
+        }
+        const worldPoint = measurementPointCoordinates(point);
+        const localPoint = drawingWorldPointToLocal(transform, worldPoint.x, worldPoint.y);
+        return measurementVertexFromCoordinates(point, localPoint, "drawing-local");
+      }
+
+      function measurementPointFromWorld(worldPoint, sourcePoint = {}, transform = null) {
+        const authoredPoint = transform ? drawingWorldPointToLocal(transform, worldPoint.x, worldPoint.y) : worldPoint;
+        return measurementPointFromCoordinates(sourcePoint, authoredPoint, transform ? "drawing-local" : null);
+      }
+
+      function measurementVertexPointFromWorld(worldPoint, sourcePoint = null, transform = null) {
+        const authoredPoint = transform ? drawingWorldPointToLocal(transform, worldPoint.x, worldPoint.y) : worldPoint;
+        return measurementVertexFromCoordinates(sourcePoint, authoredPoint, transform ? "drawing-local" : null);
       }
 
       function collectMeasurementSnapshot(measurement) {
@@ -8823,15 +9061,15 @@
         if (!snapshot) return [];
         const geometry = [];
         snapshot.points.forEach((point) => {
-          geometry.push({ kind: "point", point: measurementPointWorld(point), source: point });
+          geometry.push({ kind: "point", point: measurementPointCoordinates(point), source: point });
         });
         snapshot.lengths.forEach((length) => {
-          geometry.push({ kind: "vertex", point: { ...length.start } });
-          geometry.push({ kind: "vertex", point: { ...length.end } });
+          geometry.push({ kind: "vertex", point: measurementPointCoordinates(length.start), source: length.start });
+          geometry.push({ kind: "vertex", point: measurementPointCoordinates(length.end), source: length.end });
         });
         snapshot.areas.forEach((area) => {
           area.points.forEach((point) => {
-            geometry.push({ kind: "vertex", point: { ...point } });
+            geometry.push({ kind: "vertex", point: measurementPointCoordinates(point), source: point });
           });
         });
         return geometry;
@@ -8855,6 +9093,40 @@
           }
         );
         return {
+          left: bounds.minX - CELL_SIZE / 2,
+          top: bounds.minY - CELL_SIZE / 2,
+          right: bounds.maxX + CELL_SIZE / 2,
+          bottom: bounds.maxY + CELL_SIZE / 2,
+          minWorldX: bounds.minX - CELL_SIZE / 2,
+          minWorldY: bounds.minY - CELL_SIZE / 2,
+          maxWorldX: bounds.maxX + CELL_SIZE / 2,
+          maxWorldY: bounds.maxY + CELL_SIZE / 2,
+        };
+      }
+
+      function measurementSnapshotWorldBounds(snapshot, transform = null) {
+        const geometry = measurementSnapshotGeometry(snapshot);
+        if (!geometry.length) return null;
+        const worldGeometry = geometry.map((entry) =>
+          measurementPointAuthoringSpace(entry.source) === "drawing-local" && transform
+            ? drawingLocalPointToWorld(transform, entry.point.x, entry.point.y)
+            : entry.point
+        );
+        const bounds = worldGeometry.reduce(
+          (result, point) => ({
+            minX: Math.min(result.minX, point.x),
+            minY: Math.min(result.minY, point.y),
+            maxX: Math.max(result.maxX, point.x),
+            maxY: Math.max(result.maxY, point.y),
+          }),
+          {
+            minX: worldGeometry[0].x,
+            minY: worldGeometry[0].y,
+            maxX: worldGeometry[0].x,
+            maxY: worldGeometry[0].y,
+          }
+        );
+        return {
           minWorldX: bounds.minX - CELL_SIZE / 2,
           minWorldY: bounds.minY - CELL_SIZE / 2,
           maxWorldX: bounds.maxX + CELL_SIZE / 2,
@@ -8863,16 +9135,19 @@
       }
 
       function measurementBounds(measurement) {
-        return measurementSnapshotBounds(collectMeasurementSnapshot(measurement));
+        return measurementSnapshotWorldBounds(
+          collectMeasurementSnapshot(measurement),
+          resolveMeasurementDocumentTransform(measurement)
+        );
       }
 
       function mapMeasurementSnapshot(snapshot, transformPoint) {
         if (!snapshot) return null;
         return {
-          points: snapshot.points.map((point) => measurementPointFromWorld(transformPoint(measurementPointWorld(point)), point)),
+          points: snapshot.points.map((point) => measurementPointFromCoordinates(point, transformPoint(measurementPointCoordinates(point)))),
           lengths: snapshot.lengths.map((length) => {
-            const start = measurementVertexPointFromWorld(transformPoint(length.start));
-            const end = measurementVertexPointFromWorld(transformPoint(length.end));
+            const start = measurementVertexFromCoordinates(length.start, transformPoint(measurementPointCoordinates(length.start)));
+            const end = measurementVertexFromCoordinates(length.end, transformPoint(measurementPointCoordinates(length.end)));
             return {
               ...length,
               start,
@@ -8881,7 +9156,7 @@
             };
           }),
           areas: snapshot.areas.map((area) => {
-            const points = area.points.map((point) => measurementVertexPointFromWorld(transformPoint(point)));
+            const points = area.points.map((point) => measurementVertexFromCoordinates(point, transformPoint(measurementPointCoordinates(point))));
             return {
               ...area,
               points,
@@ -9097,6 +9372,7 @@
         const measurement = measurementEntry?.measurement || activeMeasurement();
         if (!measurement) return false;
         const measurementTarget = measurementEntry || measurement;
+        const measurementTransform = resolveMeasurementDocumentTransform(measurementTarget);
         const pointer = worldFromClient(clientX, clientY);
         const hit = measurementTransformHit(measurementTarget, pointer.worldX, pointer.worldY);
         if (!hit) return false;
@@ -9150,16 +9426,17 @@
             time: Date.now(),
           };
         }
-        const cell = cellFromWorld(pointer.worldX, pointer.worldY);
+        const authoredPoint = measurementVertexFromWorld(pointer.worldX, pointer.worldY, measurementTransform);
         state.interaction = {
           type: "measurement-move",
           measurementId: measurement.id,
           snapshot,
+          drawingTransform: measurementTransform,
           anchorClientX: clientX,
           anchorClientY: clientY,
           lockedAxis: null,
-          startCellX: cell.x,
-          startCellY: cell.y,
+          startPointX: authoredPoint.x,
+          startPointY: authoredPoint.y,
           deltaX: 0,
           deltaY: 0,
           moved: false,
@@ -9174,6 +9451,7 @@
         const target = state.activeMeasurementItem;
         if (!measurement || !target) return false;
         const measurementTarget = measurementEntry || measurement;
+        const measurementTransform = resolveMeasurementDocumentTransform(measurementTarget);
         const pointer = worldFromClient(clientX, clientY);
         const hit = measurementItemHitAt(measurementTarget, pointer.worldX, pointer.worldY);
         if (!measurementItemBelongsToTarget(hit, target)) return false;
@@ -9185,7 +9463,8 @@
             type: "measurement-item-move",
             measurementId: measurement.id,
             target: current,
-            startWorld: measurementPointWorld(point),
+            drawingTransform: measurementTransform,
+            startPoint: measurementPointCoordinates(point),
             anchorClientX: clientX,
             anchorClientY: clientY,
             lockedAxis: null,
@@ -9197,19 +9476,25 @@
         if (current.kind === "length") {
           const length = measurement.lengths.find((entry) => entry.id === current.itemId);
           if (!length) return false;
-          const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
+          const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, measurementTransform);
           state.interaction = {
             type: "measurement-item-move",
             measurementId: measurement.id,
             target: current,
+            drawingTransform: measurementTransform,
             snapshot:
               current.part === "body"
                 ? {
-                    start: { ...length.start },
-                    end: { ...length.end },
+                    start: measurementPointCoordinates(length.start),
+                    end: measurementPointCoordinates(length.end),
                   }
                 : null,
-            startWorld: current.part === "body" ? snapped : current.part === "start" ? { ...length.start } : { ...length.end },
+            startPoint:
+              current.part === "body"
+                ? snapped
+                : current.part === "start"
+                ? measurementPointCoordinates(length.start)
+                : measurementPointCoordinates(length.end),
             anchorClientX: clientX,
             anchorClientY: clientY,
             lockedAxis: null,
@@ -9221,13 +9506,14 @@
         if (current.kind === "area") {
           const area = measurement.areas.find((entry) => entry.id === current.itemId);
           if (!area) return false;
-          const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
+          const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, measurementTransform);
           state.interaction = {
             type: "measurement-item-move",
             measurementId: measurement.id,
             target: current,
-            snapshot: current.part === "body" ? area.points.map((point) => ({ ...point })) : null,
-            startWorld: current.part === "body" ? snapped : { ...area.points[current.vertexIndex] },
+            drawingTransform: measurementTransform,
+            snapshot: current.part === "body" ? area.points.map((point) => measurementPointCoordinates(point)) : null,
+            startPoint: current.part === "body" ? snapped : measurementPointCoordinates(area.points[current.vertexIndex]),
             anchorClientX: clientX,
             anchorClientY: clientY,
             lockedAxis: null,
@@ -10527,6 +10813,23 @@
         state.renderState.rulersDirty = state.renderState.rulersDirty || full || !!flags.rulers;
         if (state.renderState.frame) return;
         state.renderState.frame = window.requestAnimationFrame(flushRender);
+      }
+
+      function flushScheduledRenderNow() {
+        const hasDirtyWork =
+          state.renderState.uiDirty ||
+          state.renderState.staticDirty ||
+          state.renderState.scenesDirty ||
+          state.renderState.contentDirty ||
+          state.renderState.overlayDirty ||
+          state.renderState.rulersDirty;
+        if (!hasDirtyWork && !state.renderState.frame) return false;
+        if (state.renderState.frame) {
+          window.cancelAnimationFrame(state.renderState.frame);
+          state.renderState.frame = 0;
+        }
+        flushRender();
+        return true;
       }
 
       function flushRender() {
@@ -12744,8 +13047,8 @@
 
       function drawLayerVectorObjectsToContext(context, layer, startIndex = 0, sceneEntry = null) {
         const runtime = resolveLayerRuntimeVectorPair(sceneEntry || layer);
-        const scene = runtime.runtimeScene;
-        const projectPoint = runtime.transform ? drawingSceneProjectPoint(runtime.transform) : worldToScreen;
+        const scene = runtime.worldScene;
+        const projectPoint = worldToScreen;
         const opContext = ensureVectorOpSurface(context.canvas.width, context.canvas.height);
         for (let index = startIndex; index < scene.nodes.length; index += 1) {
           const node = scene.nodes[index];
@@ -12791,7 +13094,7 @@
 
       function ensureLayerVectorChunkRuntime(layer, cache) {
         const runtime = resolveLayerRuntimeVectorPair(layer);
-        cache.vectorRenderRevision = runtime.worldScene.sourceRevision;
+        cache.vectorRenderRevision = runtime.worldScene.revisionKey;
         return runtime;
       }
 
@@ -12824,35 +13127,37 @@
           redrawTile(tile);
           context.drawImage(tile.canvas, 0, 0, entry.canvas.width, entry.canvas.height);
         }
-        const projectPoint = runtime.transform ? drawingChunkProjectPoint(runtime.transform, tileX, tileY) : chunkProjectPoint(tileX, tileY);
+        const projectPoint = chunkProjectPoint(tileX, tileY);
         const opContext = ensureVectorOpSurface(entry.canvas.width, entry.canvas.height);
         const chunkIndices = runtime.worldScene.chunkIndex.get(tileKey(tileX, tileY)) || [];
         for (const index of chunkIndices) {
-          const node = runtime.runtimeScene.nodes[index];
+          const node = runtime.worldScene.nodes[index];
           const pixelBounds = vectorObjectPixelBounds(node, entry.canvas.width, entry.canvas.height, projectPoint);
           if (!pixelBounds) continue;
           compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds, projectPoint);
         }
-        entry.vectorCount = runtime.runtimeScene.nodes.length;
+        entry.vectorCount = runtime.worldScene.nodes.length;
         entry.tileRenderRevision = layer.tileRenderRevision || 0;
         entry.zoomKey = cache.zoomKey;
-        entry.vectorRenderRevision = runtime.worldScene.sourceRevision;
+        entry.vectorRenderRevision = runtime.worldScene.revisionKey;
+        entry.transformSignature = runtime.worldScene.sourceTransformSignature;
       }
 
       function appendLayerChunkVectorDelta(runtime, entry, layer, tileX, tileY) {
         const context = ensureChunkCanvas(entry, TILE_SIZE * CELL_SIZE * state.viewport.zoom);
-        const projectPoint = runtime.transform ? drawingChunkProjectPoint(runtime.transform, tileX, tileY) : chunkProjectPoint(tileX, tileY);
+        const projectPoint = chunkProjectPoint(tileX, tileY);
         const opContext = ensureVectorOpSurface(entry.canvas.width, entry.canvas.height);
         const chunkIndices = runtime.worldScene.chunkIndex.get(tileKey(tileX, tileY)) || [];
         for (const index of chunkIndices) {
           if (index < entry.vectorCount) continue;
-          const node = runtime.runtimeScene.nodes[index];
+          const node = runtime.worldScene.nodes[index];
           const pixelBounds = vectorObjectPixelBounds(node, entry.canvas.width, entry.canvas.height, projectPoint);
           if (!pixelBounds) continue;
           compositeVectorObjectToLayerContext(context, opContext, node.vectorObject, pixelBounds, projectPoint);
         }
-        entry.vectorCount = runtime.runtimeScene.nodes.length;
-        entry.vectorRenderRevision = runtime.worldScene.sourceRevision;
+        entry.vectorCount = runtime.worldScene.nodes.length;
+        entry.vectorRenderRevision = runtime.worldScene.revisionKey;
+        entry.transformSignature = runtime.worldScene.sourceTransformSignature;
       }
 
       function drawLayerVisibleChunksToContent(layer, bounds, tileSpan) {
@@ -12876,19 +13181,21 @@
                 vectorCount: -1,
                 tileRenderRevision: -1,
                 vectorRenderRevision: -1,
+                transformSignature: "",
                 zoomKey: "",
               };
               cache.chunkCanvases.set(key, entry);
             }
             const tileChunkDirty = cache.dirtyTileChunkKeys.has(key);
             const vectorChunkDirty = runtime.worldScene.dirtyChunkKeys.has(key);
-            const needsChunkRebuild = !entry.canvas || entry.zoomKey !== cache.zoomKey;
+            const transformChanged = entry.transformSignature !== runtime.worldScene.sourceTransformSignature;
+            const needsChunkRebuild = !entry.canvas || entry.zoomKey !== cache.zoomKey || transformChanged;
             if (needsChunkRebuild || tileChunkDirty) {
               rebuildLayerChunk(cache, runtime, entry, layer, tileX, tileY, tileSpan);
               cache.dirtyTileChunkKeys.delete(key);
               runtime.worldScene.dirtyChunkKeys.delete(key);
             } else if (vectorChunkDirty) {
-              if (runtime.worldScene.updateMode !== "append" || entry.vectorCount >= runtime.runtimeScene.nodes.length) {
+              if (runtime.worldScene.updateMode !== "append" || entry.vectorCount >= runtime.worldScene.nodes.length) {
                 rebuildLayerChunk(cache, runtime, entry, layer, tileX, tileY, tileSpan);
               } else {
                 appendLayerChunkVectorDelta(runtime, entry, layer, tileX, tileY);
@@ -12938,6 +13245,8 @@
                 !tileChunkDirty &&
                 !vectorChunkDirty &&
                 entry.zoomKey === zoomKey &&
+                entry.transformSignature === scene.sourceTransformSignature &&
+                entry.vectorRenderRevision === scene.revisionKey &&
                 !!entry.canvas
               ) {
                 continue;
@@ -12978,13 +13287,17 @@
               vectorCount: -1,
               tileRenderRevision: -1,
               vectorRenderRevision: -1,
+              transformSignature: "",
               zoomKey: "",
             };
             cache.chunkCanvases.set(key, entry);
           }
           const tileChunkDirty = cache.dirtyTileChunkKeys.has(key);
           const vectorChunkDirty = runtime.worldScene.dirtyChunkKeys.has(key);
-          const needsRebuild = entry.zoomKey !== cache.zoomKey || !entry.canvas;
+          const needsRebuild =
+            entry.zoomKey !== cache.zoomKey ||
+            !entry.canvas ||
+            entry.transformSignature !== runtime.worldScene.sourceTransformSignature;
           if (needsRebuild || tileChunkDirty) {
             rebuildLayerChunk(cache, runtime, entry, layer, task.tileX, task.tileY, tileSpan);
             cache.dirtyTileChunkKeys.delete(key);
@@ -12992,7 +13305,7 @@
             queueMainContentChunkRedraw(task.tileX, task.tileY);
             changed = true;
           } else if (vectorChunkDirty) {
-            if (runtime.worldScene.updateMode === "append" && entry.vectorCount < runtime.runtimeScene.nodes.length) {
+            if (runtime.worldScene.updateMode === "append" && entry.vectorCount < runtime.worldScene.nodes.length) {
               appendLayerChunkVectorDelta(runtime, entry, layer, task.tileX, task.tileY);
             } else {
               rebuildLayerChunk(cache, runtime, entry, layer, task.tileX, task.tileY, tileSpan);
@@ -13173,7 +13486,7 @@
         cache.signature = signature;
         cache.tileRenderRevision = layer.tileRenderRevision || 0;
         cache.vectorCount = scene.nodes.length;
-        cache.vectorRenderRevision = scene.sourceRevision;
+        cache.vectorRenderRevision = scene.revisionKey;
       }
 
       function drawLayerCompositeToContent(layer, width, height, bounds, tileSpan) {
@@ -13184,7 +13497,7 @@
         const vectorCount = scene.nodes.length;
         const viewportChanged = cache.signature !== signature;
         const tilesChanged = cache.tileRenderRevision !== tileRevision;
-        const vectorChanged = cache.vectorRenderRevision !== scene.sourceRevision;
+        const vectorChanged = cache.vectorRenderRevision !== scene.revisionKey;
         const needsFullRebuild = viewportChanged || tilesChanged || vectorChanged || vectorCount < cache.vectorCount;
 
         if (needsFullRebuild) {
@@ -13192,7 +13505,7 @@
         } else if (vectorCount > cache.vectorCount) {
           drawLayerVectorObjectsToContext(cache.context, layer, cache.vectorCount);
           cache.vectorCount = vectorCount;
-          cache.vectorRenderRevision = scene.sourceRevision;
+          cache.vectorRenderRevision = scene.revisionKey;
         }
 
         contentCtx.save();
@@ -13261,38 +13574,23 @@
       }
 
       function measurementPointWorld(point, measurementEntry = null) {
-        if (typeof point.x === "number" && typeof point.y === "number") {
-          if (point.space === "drawing-local" && measurementEntry?.transform) {
-            return drawingLocalPointToWorld(measurementEntry.transform, point.x, point.y);
-          }
-          return {
-            x: point.x,
-            y: point.y,
-          };
+        const coordinates = measurementPointCoordinates(point);
+        if (measurementPointAuthoringSpace(point) === "drawing-local" && measurementEntry?.transform) {
+          return drawingLocalPointToWorld(measurementEntry.transform, coordinates.x, coordinates.y);
         }
-        return {
-          x: (point.cellX + 0.5) * CELL_SIZE,
-          y: (point.cellY + 0.5) * CELL_SIZE,
-        };
+        return coordinates;
       }
 
       function measurementVertexWorld(point, measurementEntry = null) {
-        if (!point) return { x: 0, y: 0 };
-        if (point.space === "drawing-local" && measurementEntry?.transform) {
-          return drawingLocalPointToWorld(measurementEntry.transform, point.x, point.y);
+        const coordinates = measurementPointCoordinates(point);
+        if (measurementPointAuthoringSpace(point) === "drawing-local" && measurementEntry?.transform) {
+          return drawingLocalPointToWorld(measurementEntry.transform, coordinates.x, coordinates.y);
         }
-        return {
-          x: point.x,
-          y: point.y,
-        };
+        return coordinates;
       }
 
-      function measurementVertexFromWorld(worldX, worldY) {
-        const step = CELL_SIZE / 2;
-        return {
-          x: Math.round(worldX / step) * step,
-          y: Math.round(worldY / step) * step,
-        };
+      function measurementVertexFromWorld(worldX, worldY, transform = null, sourcePoint = null) {
+        return measurementVertexPointFromWorld({ x: worldX, y: worldY }, sourcePoint, transform);
       }
 
       function pointsEqual(a, b) {
@@ -13300,15 +13598,17 @@
       }
 
       function measurementLengthMeters(start, end) {
-        return metersFromWorldUnits(Math.hypot(end.x - start.x, end.y - start.y));
+        const startPoint = measurementPointCoordinates(start);
+        const endPoint = measurementPointCoordinates(end);
+        return metersFromWorldUnits(Math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y));
       }
 
       function measurementAreaSquareMeters(points) {
         if (!points || points.length < 3) return 0;
         let sum = 0;
         for (let index = 0; index < points.length; index += 1) {
-          const current = points[index];
-          const next = points[(index + 1) % points.length];
+          const current = measurementPointCoordinates(points[index]);
+          const next = measurementPointCoordinates(points[(index + 1) % points.length]);
           sum += current.x * next.y - next.x * current.y;
         }
         const worldArea = Math.abs(sum) / 2;
@@ -13358,6 +13658,17 @@
           if (intersects) inside = !inside;
         }
         return inside;
+      }
+
+      function measurementLengthWorld(length, measurementEntry = null) {
+        return {
+          start: measurementVertexWorld(length?.start, measurementEntry),
+          end: measurementVertexWorld(length?.end, measurementEntry),
+        };
+      }
+
+      function measurementAreaWorldPoints(area, measurementEntry = null) {
+        return Array.isArray(area?.points) ? area.points.map((point) => measurementVertexWorld(point, measurementEntry)) : [];
       }
 
       function pointInRect(point, rect) {
@@ -13493,26 +13804,30 @@
         return [handles.nw, handles.ne, handles.se, handles.sw];
       }
 
-      function measurementEntityMatchesRect(kind, entry, rect, containment) {
+      function measurementEntityMatchesRect(kind, entry, rect, containment, measurementEntry = null) {
         if (kind === "point") {
-          return pointInRect(measurementPointWorld(entry), rect);
+          return pointInRect(measurementPointWorld(entry, measurementEntry), rect);
         }
         if (kind === "length") {
+          const { start, end } = measurementLengthWorld(entry, measurementEntry);
           return containment
-            ? pointInRect(entry.start, rect) && pointInRect(entry.end, rect)
-            : segmentIntersectsRect(entry.start, entry.end, rect);
+            ? pointInRect(start, rect) && pointInRect(end, rect)
+            : segmentIntersectsRect(start, end, rect);
         }
         if (kind === "area") {
-          return containment ? entry.points.every((point) => pointInRect(point, rect)) : polygonIntersectsRect(entry.points, rect);
+          const points = measurementAreaWorldPoints(entry, measurementEntry);
+          return containment ? points.every((point) => pointInRect(point, rect)) : polygonIntersectsRect(points, rect);
         }
         return false;
       }
 
       function measurementMatchesRect(measurement, rect, containment) {
+        const measurementEntry = resolveMeasurementSceneEntry(measurement);
+        const measurementData = measurementEntry?.measurement || measurement;
         return (
-          measurement.points.some((point) => measurementEntityMatchesRect("point", point, rect, containment)) ||
-          measurement.lengths.some((length) => measurementEntityMatchesRect("length", length, rect, containment)) ||
-          measurement.areas.some((area) => measurementEntityMatchesRect("area", area, rect, containment))
+          measurementData.points.some((point) => measurementEntityMatchesRect("point", point, rect, containment, measurementEntry)) ||
+          measurementData.lengths.some((length) => measurementEntityMatchesRect("length", length, rect, containment, measurementEntry)) ||
+          measurementData.areas.some((area) => measurementEntityMatchesRect("area", area, rect, containment, measurementEntry))
         );
       }
 
@@ -13755,14 +14070,15 @@
       }
 
       function eraseMeasurementAt(clientX, clientY) {
-        const measurement = activeMeasurement();
+        const measurementEntry = activeMeasurementSceneEntry();
+        const measurement = measurementEntry?.measurement || activeMeasurement();
         if (!measurement) return false;
         const pointer = worldFromClient(clientX, clientY);
         const tolerance = Math.max(CELL_SIZE * 0.12, (measurement.width + 3) / state.viewport.zoom);
         let changed = false;
 
         const remainingPoints = measurement.points.filter((point) => {
-          const worldPoint = measurementPointWorld(point);
+          const worldPoint = measurementPointWorld(point, measurementEntry);
           const hit = Math.hypot(pointer.worldX - worldPoint.x, pointer.worldY - worldPoint.y) <= tolerance;
           changed = changed || hit;
           return !hit;
@@ -13770,21 +14086,23 @@
         measurement.points = remainingPoints;
 
         const remainingLengths = measurement.lengths.filter((length) => {
+          const worldLength = measurementLengthWorld(length, measurementEntry);
           const hit =
-            distanceToSegment(pointer.worldX, pointer.worldY, length.start, length.end) <= tolerance ||
-            Math.hypot(pointer.worldX - length.start.x, pointer.worldY - length.start.y) <= tolerance ||
-            Math.hypot(pointer.worldX - length.end.x, pointer.worldY - length.end.y) <= tolerance;
+            distanceToSegment(pointer.worldX, pointer.worldY, worldLength.start, worldLength.end) <= tolerance ||
+            Math.hypot(pointer.worldX - worldLength.start.x, pointer.worldY - worldLength.start.y) <= tolerance ||
+            Math.hypot(pointer.worldX - worldLength.end.x, pointer.worldY - worldLength.end.y) <= tolerance;
           changed = changed || hit;
           return !hit;
         });
         measurement.lengths = remainingLengths;
 
         const remainingAreas = measurement.areas.filter((area) => {
-          const hitEdge = area.points.some((point, index) => {
-            const next = area.points[(index + 1) % area.points.length];
+          const worldPoints = measurementAreaWorldPoints(area, measurementEntry);
+          const hitEdge = worldPoints.some((point, index) => {
+            const next = worldPoints[(index + 1) % worldPoints.length];
             return distanceToSegment(pointer.worldX, pointer.worldY, point, next) <= tolerance;
           });
-          const hit = hitEdge || pointInPolygon(pointer.worldX, pointer.worldY, area.points);
+          const hit = hitEdge || pointInPolygon(pointer.worldX, pointer.worldY, worldPoints);
           changed = changed || hit;
           return !hit;
         });
@@ -14055,6 +14373,7 @@
 
       function drawMeasurementDraft(context, draft, measurement) {
         if (!draft || !measurement) return;
+        const measurementEntry = draft.drawingTransform ? { transform: draft.drawingTransform } : null;
         const color = state.color.active;
         const dimensionLabels = [];
         context.save();
@@ -14063,8 +14382,10 @@
         context.lineWidth = Math.max(1, measurement.width);
 
         if (draft.type === "length-click" || draft.type === "length-drag") {
-          const start = worldToScreen(draft.start.x, draft.start.y);
-          const end = worldToScreen(draft.end.x, draft.end.y);
+          const startWorld = measurementVertexWorld(draft.start, measurementEntry);
+          const endWorld = measurementVertexWorld(draft.end, measurementEntry);
+          const start = worldToScreen(startWorld.x, startWorld.y);
+          const end = worldToScreen(endWorld.x, endWorld.y);
           context.beginPath();
           context.moveTo(start.x, start.y);
           context.lineTo(end.x, end.y);
@@ -14078,7 +14399,10 @@
           const draftPoints = draft.points.concat(
             draft.hover && !pointsEqual(draft.hover, draft.points[draft.points.length - 1]) ? [draft.hover] : []
           );
-          const screenPoints = draftPoints.map((point) => worldToScreen(point.x, point.y));
+          const screenPoints = draftPoints.map((point) => {
+            const worldPoint = measurementVertexWorld(point, measurementEntry);
+            return worldToScreen(worldPoint.x, worldPoint.y);
+          });
           context.beginPath();
           context.moveTo(screenPoints[0].x, screenPoints[0].y);
           screenPoints.slice(1).forEach((point) => context.lineTo(point.x, point.y));
@@ -14243,15 +14567,16 @@
             overlayCtx.fillStyle = hexToRgba(getCssVar("--crosshair"), 0.18);
             overlayCtx.lineWidth = 1.5;
             if (activeItemData.target.kind === "point") {
-              const worldPoint = measurementPointWorld(activeItemData.point);
+              const worldPoint = measurementPointWorld(activeItemData.point, activeItemData.measurementEntry);
               const screenPoint = worldToScreen(worldPoint.x, worldPoint.y);
               overlayCtx.beginPath();
               overlayCtx.arc(screenPoint.x, screenPoint.y, Math.max(6, activeMeasurementEntity.width + 4), 0, Math.PI * 2);
               overlayCtx.fill();
               overlayCtx.stroke();
             } else if (activeItemData.target.kind === "length") {
-              const start = worldToScreen(activeItemData.length.start.x, activeItemData.length.start.y);
-              const end = worldToScreen(activeItemData.length.end.x, activeItemData.length.end.y);
+              const worldLength = measurementLengthWorld(activeItemData.length, activeItemData.measurementEntry);
+              const start = worldToScreen(worldLength.start.x, worldLength.start.y);
+              const end = worldToScreen(worldLength.end.x, worldLength.end.y);
               overlayCtx.beginPath();
               overlayCtx.moveTo(start.x, start.y);
               overlayCtx.lineTo(end.x, end.y);
@@ -14267,7 +14592,9 @@
                 overlayCtx.stroke();
               });
             } else if (activeItemData.target.kind === "area") {
-              const screenPoints = activeItemData.area.points.map((point) => worldToScreen(point.x, point.y));
+              const screenPoints = measurementAreaWorldPoints(activeItemData.area, activeItemData.measurementEntry).map((point) =>
+                worldToScreen(point.x, point.y)
+              );
               overlayCtx.beginPath();
               overlayCtx.moveTo(screenPoints[0].x, screenPoints[0].y);
               screenPoints.slice(1).forEach((point) => overlayCtx.lineTo(point.x, point.y));
@@ -14487,46 +14814,35 @@
         if (state.interaction && state.interaction.type === "brush" && state.interaction.vectorStampCells?.length) {
           drawBrushStrokePreviewOverlay(overlayCtx, state.interaction);
         } else if (state.pointer.inside && state.activeTool === "brush") {
-          const pointer = worldFromClient(state.pointer.clientX, state.pointer.clientY);
-          const rawCell = cellFromWorld(pointer.worldX, pointer.worldY);
-          const cell =
-            state.interaction && state.interaction.type === "brush"
-              ? brushCellWithAxisLock(
-                  state.interaction,
-                  state.pointer.clientX,
-                  state.pointer.clientY,
-                  rawCell.x,
-                  rawCell.y,
-                  state.pointer.shiftKey
-                )
-              : rawCell;
-          const bounds = brushFootprintBounds(cell.x, cell.y);
-          const size = CELL_SIZE * state.viewport.zoom;
-          const x = snapPixel(state.viewport.x + bounds.minX * size);
-          const y = snapPixel(state.viewport.y + bounds.minY * size);
-          const snappedWidth = Math.max(1, snapPixel((bounds.maxX - bounds.minX + 1) * size));
-          const snappedHeight = Math.max(1, snapPixel((bounds.maxY - bounds.minY + 1) * size));
-          overlayCtx.save();
-          overlayCtx.fillStyle = hexToRgba(state.color.active, 0.18);
-          overlayCtx.strokeStyle = hexToRgba(state.color.active, 0.56);
-          if (state.brush.shape === "circle") {
-            overlayCtx.beginPath();
-            overlayCtx.ellipse(
-              x + snappedWidth / 2,
-              y + snappedHeight / 2,
-              Math.max(1, snappedWidth / 2),
-              Math.max(1, snappedHeight / 2),
-              0,
-              0,
-              Math.PI * 2
-            );
-            overlayCtx.fill();
-            overlayCtx.stroke();
-          } else {
-            overlayCtx.fillRect(x, y, snappedWidth, snappedHeight);
-            overlayCtx.strokeRect(x + 0.5, y + 0.5, snappedWidth - 1, snappedHeight - 1);
+          const layer = activeLayer();
+          if (layer) {
+            const layerTransform = resolveLayerDocumentTransform(layer);
+            const pointer = worldFromClient(state.pointer.clientX, state.pointer.clientY);
+            const rawCell = drawingLocalCellFromWorld(layerTransform, pointer.worldX, pointer.worldY);
+            const cell =
+              state.interaction && state.interaction.type === "brush"
+                ? brushCellWithAxisLock(
+                    state.interaction,
+                    state.pointer.clientX,
+                    state.pointer.clientY,
+                    rawCell.x,
+                    rawCell.y,
+                    state.pointer.shiftKey
+                  )
+                : rawCell;
+            drawBrushStrokePreviewOverlay(overlayCtx, {
+              type: "brush",
+              layerId: layer.id,
+              drawingTransform: layerTransform,
+              mode: "paint",
+              brushShape: state.brush.shape,
+              brushWidth: state.brush.width,
+              brushHeight: state.brush.height,
+              vectorStyle: currentVectorStyleSnapshot(),
+              vectorStampCells: [cell],
+              vectorStampKeys: new Set([cell.x + ":" + cell.y]),
+            });
           }
-          overlayCtx.restore();
         }
 
         if (state.interaction && state.interaction.type === "shape") {
@@ -14538,13 +14854,11 @@
         }
 
         if (state.shapeDraft && state.shapeDraft.type === "polygon") {
+          const transform = state.shapeDraft.drawingTransform || resolveLayerDocumentTransform(state.shapeDraft.layerId);
           const draftPoints = state.shapeDraft.points.slice();
           const lastPoint = draftPoints[draftPoints.length - 1];
           const previewPoint = state.shapeDraft.hover || lastPoint;
-          const previewWorld = state.shapeDraft.hoverWorld || {
-            x: (previewPoint.x + 0.5) * CELL_SIZE,
-            y: (previewPoint.y + 0.5) * CELL_SIZE,
-          };
+          const previewWorld = state.shapeDraft.hoverWorld || drawingLocalCellCenterWorld(previewPoint, transform);
           const hasPreviewSegment =
             !!previewPoint &&
             !!lastPoint &&
@@ -14560,8 +14874,9 @@
           if (draftPoints.length >= 2 || (draftPoints.length === 1 && hasPreviewSegment)) {
             overlayCtx.beginPath();
             draftPoints.forEach((point, index) => {
-              const screenX = snapPixel(state.viewport.x + (point.x + 0.5) * CELL_SIZE * state.viewport.zoom);
-              const screenY = snapPixel(state.viewport.y + (point.y + 0.5) * CELL_SIZE * state.viewport.zoom);
+              const worldPoint = drawingLocalCellCenterWorld(point, transform);
+              const screenX = snapPixel(state.viewport.x + worldPoint.x * state.viewport.zoom);
+              const screenY = snapPixel(state.viewport.y + worldPoint.y * state.viewport.zoom);
               if (index === 0) overlayCtx.moveTo(screenX, screenY);
               else overlayCtx.lineTo(screenX, screenY);
             });
@@ -14577,18 +14892,16 @@
             }
             overlayCtx.stroke();
             if (hasPreviewSegment && lastPoint) {
-              const startWorld = {
-                x: (lastPoint.x + 0.5) * CELL_SIZE,
-                y: (lastPoint.y + 0.5) * CELL_SIZE,
-              };
+              const startWorld = drawingLocalCellCenterWorld(lastPoint, transform);
               const segmentMeters = measurementLengthMeters(startWorld, previewWorld);
               drawPreviewDimensionStack(overlayCtx, [formatMetersValue(segmentMeters)]);
             }
           }
 
           draftPoints.forEach((point, index) => {
-            const screenX = snapPixel(state.viewport.x + (point.x + 0.5) * CELL_SIZE * state.viewport.zoom);
-            const screenY = snapPixel(state.viewport.y + (point.y + 0.5) * CELL_SIZE * state.viewport.zoom);
+            const worldPoint = drawingLocalCellCenterWorld(point, transform);
+            const screenX = snapPixel(state.viewport.x + worldPoint.x * state.viewport.zoom);
+            const screenY = snapPixel(state.viewport.y + worldPoint.y * state.viewport.zoom);
             overlayCtx.beginPath();
             overlayCtx.fillStyle = index === 0 ? getCssVar("--crosshair") : getCssVar("--bg-strong");
             overlayCtx.strokeStyle =
@@ -14646,42 +14959,36 @@
         }
 
       function drawShapePreviewOverlay(overlayCtx, shapePreview) {
+          const transform = shapePreview.drawingTransform || resolveLayerDocumentTransform(shapePreview.layerId);
+          const previewObject = createShapeVectorObject(shapePreview);
+          const fillColor = shapePreview.mode === "paint" ? hexToRgba(state.color.active, 0.18) : hexToRgba(getCssVar("--text"), 0.12);
+          const strokeColor = shapePreview.mode === "paint" ? hexToRgba(state.color.active, 0.56) : hexToRgba(getCssVar("--text"), 0.42);
+          if (previewObject) {
+            previewObject.style = {
+              ...(previewObject.style || {}),
+              noFill: false,
+              fillColor,
+              outlineColor: strokeColor,
+              outlineWidthCells: Math.max(Number(previewObject.style?.outlineWidthCells || 0), 0.05),
+            };
+          }
           overlayCtx.save();
-          overlayCtx.fillStyle =
-            shapePreview.mode === "paint" ? hexToRgba(state.color.active, 0.18) : hexToRgba(getCssVar("--text"), 0.12);
-          overlayCtx.strokeStyle =
-            shapePreview.mode === "paint" ? hexToRgba(state.color.active, 0.56) : hexToRgba(getCssVar("--text"), 0.42);
-          const size = CELL_SIZE * state.viewport.zoom;
           const dimensionLabels = [];
+          if (previewObject) {
+            renderVectorObjectToContext(overlayCtx, previewObject, "paint", drawingSceneProjectPoint(transform));
+          }
           if (shapePreview.shapeType === "circle") {
             const spec = circleSpecFromInteraction(shapePreview);
-            const centerX = snapPixel(state.viewport.x + (spec.centerX + 0.5) * size);
-            const centerY = snapPixel(state.viewport.y + (spec.centerY + 0.5) * size);
-            const radius = Math.max(size / 2, spec.radius * size);
-            overlayCtx.beginPath();
-            overlayCtx.ellipse(centerX, centerY, radius, radius, 0, 0, Math.PI * 2);
-            overlayCtx.fill();
-            overlayCtx.stroke();
             const metersValue = metersFromWorldUnits(spec.radius * CELL_SIZE * 2);
             dimensionLabels.push("D: " + formatMetersValue(metersValue));
           } else {
             const bounds = shapeBoundsFromInteraction(shapePreview);
-            const x = snapPixel(state.viewport.x + bounds.minX * size);
-            const y = snapPixel(state.viewport.y + bounds.minY * size);
-            const width = Math.max(1, snapPixel((bounds.maxX - bounds.minX + 1) * size));
-            const height = Math.max(1, snapPixel((bounds.maxY - bounds.minY + 1) * size));
             const widthMeters = metersFromWorldUnits((bounds.maxX - bounds.minX + 1) * CELL_SIZE);
             const heightMeters = metersFromWorldUnits((bounds.maxY - bounds.minY + 1) * CELL_SIZE);
             if (shapePreview.shapeType === "ellipse") {
-              overlayCtx.beginPath();
-              overlayCtx.ellipse(x + width / 2, y + height / 2, Math.max(0.5, width / 2), Math.max(0.5, height / 2), 0, 0, Math.PI * 2);
-              overlayCtx.fill();
-              overlayCtx.stroke();
               dimensionLabels.push("DX: " + formatMetersValue(widthMeters));
               dimensionLabels.push("DY: " + formatMetersValue(heightMeters));
             } else {
-              overlayCtx.fillRect(x, y, width, height);
-              overlayCtx.strokeRect(x + 0.5, y + 0.5, width - 1, height - 1);
               dimensionLabels.push("X: " + formatMetersValue(widthMeters));
               dimensionLabels.push("Y: " + formatMetersValue(heightMeters));
             }
@@ -15199,6 +15506,7 @@
         return {
           id: generateVectorObjectId(),
           kind: "brushStroke",
+          space: "drawing-local",
           sourceTool: "brush",
           compositeMode: interaction.mode === "erase" ? "erase" : "paint",
           brushShape: interaction.brushShape,
@@ -15336,7 +15644,7 @@
 
       function appendVectorObject(layer, vectorObject) {
         if (!layer || !vectorObject) return false;
-        markLayerVectorSceneRectDirty(layer, expandedVectorObjectBoundsRect(vectorObject));
+        markLayerVectorSceneRectDirty(layer, vectorObjectWorldRasterBounds(vectorObject, resolveLayerDocumentTransform(layer)));
         layer.vectorObjects.push(vectorObject);
         bumpLayerVectorRevision(layer);
         return true;
@@ -15347,6 +15655,7 @@
         const base = {
           id: generateVectorObjectId(),
           kind: "shape",
+          space: "drawing-local",
           sourceTool: "shape",
           compositeMode: interaction.mode === "erase" ? "erase" : "paint",
           shapeType: interaction.shapeType,
@@ -15378,6 +15687,7 @@
         return {
           id: generateVectorObjectId(),
           kind: "shape",
+          space: "drawing-local",
           sourceTool: "shape",
           compositeMode: mode === "erase" ? "erase" : "paint",
           shapeType: "polygon",
@@ -15620,28 +15930,21 @@
         const previewAlpha = interaction.mode === "erase" ? 0.12 : 0.18;
         const strokeColor = interaction.mode === "erase" ? getCssVar("--text") : interaction.vectorStyle?.outlineColor || previewColor;
         const strokeAlpha = interaction.mode === "erase" ? 0.34 : 0.56;
-        const size = CELL_SIZE * state.viewport.zoom;
-        context.save();
-        context.fillStyle = hexToRgba(previewColor, previewAlpha);
-        context.strokeStyle = hexToRgba(strokeColor, strokeAlpha);
-        context.lineWidth = 1;
-        interaction.vectorStampCells.forEach((cell) => {
-          const bounds = brushFootprintBoundsForConfig(cell.x, cell.y, interaction.brushWidth, interaction.brushHeight);
-          const x = snapPixel(state.viewport.x + bounds.minX * size);
-          const y = snapPixel(state.viewport.y + bounds.minY * size);
-          const width = Math.max(1, snapPixel((bounds.maxX - bounds.minX + 1) * size));
-          const height = Math.max(1, snapPixel((bounds.maxY - bounds.minY + 1) * size));
-          if (interaction.brushShape === "circle") {
-            context.beginPath();
-            context.ellipse(x + width / 2, y + height / 2, Math.max(0.5, width / 2), Math.max(0.5, height / 2), 0, 0, Math.PI * 2);
-            context.fill();
-            context.stroke();
-          } else {
-            context.fillRect(x, y, width, height);
-            context.strokeRect(x + 0.5, y + 0.5, width - 1, height - 1);
-          }
-        });
-        context.restore();
+        const previewObject = createBrushStrokeVectorObject(interaction);
+        if (!previewObject) return;
+        previewObject.style = {
+          ...(previewObject.style || {}),
+          noFill: false,
+          fillColor: hexToRgba(previewColor, previewAlpha),
+          outlineColor: hexToRgba(strokeColor, strokeAlpha),
+          outlineWidthCells: Math.max(Number(previewObject.style?.outlineWidthCells || 0), 0.05),
+        };
+        renderVectorObjectToContext(
+          context,
+          previewObject,
+          "paint",
+          drawingSceneProjectPoint(interaction.drawingTransform || resolveLayerDocumentTransform(interaction.layerId))
+        );
       }
 
       function worldRectFromBounds(bounds) {
@@ -15816,12 +16119,11 @@
         const runtime = resolveLayerRuntimeVectorPair(layer);
         const candidateIndices = layerVectorScenePointCandidateIndices(runtime.worldScene, worldX, worldY);
         if (!candidateIndices.length) return null;
-        const samplePoint = runtime.transform ? drawingWorldPointToLocal(runtime.transform, worldX, worldY) : { x: worldX, y: worldY };
         let visible = false;
         let color = null;
         candidateIndices.forEach((index) => {
-          const node = runtime.runtimeScene.nodes[index];
-          const stateAtPoint = vectorObjectPaintStateAtPoint(node.vectorObject, samplePoint.x, samplePoint.y);
+          const node = runtime.worldScene.nodes[index];
+          const stateAtPoint = vectorObjectPaintStateAtPoint(node.vectorObject, worldX, worldY);
           if (!stateAtPoint.visible && stateAtPoint.color === null) return;
           visible = stateAtPoint.visible;
           color = stateAtPoint.visible ? stateAtPoint.color : null;
@@ -15900,15 +16202,14 @@
 
       function layerHasVectorMatch(layer, rect, containment) {
         const runtime = resolveLayerRuntimeVectorPair(layer);
-        const scene = runtime.runtimeScene;
+        const scene = runtime.worldScene;
         if (!scene.paintNodeIndices.length) return false;
-        const testRect = runtime.transform ? mapWorldRectToDrawingLocalRect(rect, runtime.transform) : rect;
-        if (scene.paintedBounds && !rectsIntersect(scene.paintedBounds, testRect) && !rectContainsRect(testRect, scene.paintedBounds)) {
+        if (scene.paintedBounds && !rectsIntersect(scene.paintedBounds, rect) && !rectContainsRect(rect, scene.paintedBounds)) {
           return false;
         }
         return containment
-          ? scene.paintNodeIndices.some((index) => rectContainsRect(testRect, scene.nodes[index].authoredBounds))
-          : scene.paintNodeIndices.some((index) => rectsIntersect(scene.nodes[index].authoredBounds, testRect));
+          ? scene.paintNodeIndices.some((index) => rectContainsRect(rect, scene.nodes[index].authoredBounds))
+          : scene.paintNodeIndices.some((index) => rectsIntersect(scene.nodes[index].authoredBounds, rect));
       }
 
       function samplePaintColorAt(worldX, worldY) {
@@ -15931,13 +16232,15 @@
       }
 
       function beginBrush(clientX, clientY, mode, shiftKey) {
-        const pointer = worldFromClient(clientX, clientY);
-        const cell = cellFromWorld(pointer.worldX, pointer.worldY);
         const layer = activeLayer();
         if (!layer) return;
+        const layerTransform = resolveLayerDocumentTransform(layer);
+        const pointer = worldFromClient(clientX, clientY);
+        const cell = drawingLocalCellFromWorld(layerTransform, pointer.worldX, pointer.worldY);
         state.interaction = {
           type: "brush",
           layerId: layer.id,
+          drawingTransform: layerTransform,
           mode,
           brushShape: state.brush.shape,
           brushWidth: state.brush.width,
@@ -15983,11 +16286,15 @@
       }
 
       function beginShape(clientX, clientY, mode, centered) {
+        const layer = activeLayer();
+        if (!layer) return;
+        const layerTransform = resolveLayerDocumentTransform(layer);
         const pointer = worldFromClient(clientX, clientY);
-        const cell = cellFromWorld(pointer.worldX, pointer.worldY);
-        if (!activeLayer()) return;
+        const cell = drawingLocalCellFromWorld(layerTransform, pointer.worldX, pointer.worldY);
         state.interaction = {
           type: "shape",
+          layerId: layer.id,
+          drawingTransform: layerTransform,
           mode,
           shapeType: state.shape.type,
           centered: centered && (state.shape.type === "ellipse" || state.shape.type === "circle"),
@@ -16008,6 +16315,8 @@
       function shapeInteractionFromDraft(draft, currentCellX, currentCellY, centered) {
         return {
           type: "shape",
+          layerId: draft.layerId || activeLayer()?.id || null,
+          drawingTransform: draft.drawingTransform || resolveLayerDocumentTransform(activeLayer()),
           mode: draft.mode,
           shapeType: draft.shapeType,
           centered: shapeCenteredMode(draft.shapeType, centered),
@@ -16023,6 +16332,8 @@
       function beginShapeClickDraft(interaction) {
         state.shapeDraft = {
           type: "shape-click",
+          layerId: interaction.layerId,
+          drawingTransform: interaction.drawingTransform || resolveLayerDocumentTransform(activeLayer()),
           mode: interaction.mode,
           shapeType: interaction.shapeType,
           centered: interaction.centered,
@@ -16071,12 +16382,24 @@
       }
 
       function beginPolygonShape(clientX, clientY, mode, shiftKey) {
+        const layer = activeLayer();
+        if (!layer) return;
+        const layerTransform = resolveLayerDocumentTransform(layer);
         const pointer = worldFromClient(clientX, clientY);
         const draft = state.shapeDraft;
         const anchorPoint = draft && draft.type === "polygon" && draft.mode === mode && draft.points.length
           ? draft.points[draft.points.length - 1]
           : null;
-        const preview = polygonPreviewWithAxisLock(draft, anchorPoint, clientX, clientY, pointer.worldX, pointer.worldY, shiftKey);
+        const preview = polygonPreviewWithAxisLock(
+          draft,
+          anchorPoint,
+          clientX,
+          clientY,
+          pointer.worldX,
+          pointer.worldY,
+          shiftKey,
+          draft?.drawingTransform || layerTransform
+        );
         const point = preview.cell;
         const now = Date.now();
         const previousClick = state.polygonClickMemory;
@@ -16097,14 +16420,13 @@
         if (!draft || draft.type !== "polygon" || draft.mode !== mode) {
           state.shapeDraft = {
             type: "polygon",
+            layerId: layer.id,
+            drawingTransform: layerTransform,
             mode,
             points: [point],
             vectorStyle: currentVectorStyleSnapshot(),
             hover: point,
-            hoverWorld: {
-              x: (point.x + 0.5) * CELL_SIZE,
-              y: (point.y + 0.5) * CELL_SIZE,
-            },
+            hoverWorld: drawingLocalCellCenterWorld(point, layerTransform),
             anchorClientX: clientX,
             anchorClientY: clientY,
             lockedAxis: null,
@@ -16126,10 +16448,7 @@
           draft.points.push(point);
         }
         draft.hover = point;
-        draft.hoverWorld = {
-          x: (point.x + 0.5) * CELL_SIZE,
-          y: (point.y + 0.5) * CELL_SIZE,
-        };
+        draft.hoverWorld = drawingLocalCellCenterWorld(point, draft.drawingTransform || layerTransform);
         draft.anchorClientX = clientX;
         draft.anchorClientY = clientY;
         draft.lockedAxis = null;
@@ -16212,24 +16531,25 @@
           interaction.lockedAxis = Math.abs(deltaClientX) > Math.abs(deltaClientY) ? "x" : "y";
         }
         if (interaction.lockedAxis === "x") {
-          return { x: point.x, y: anchorPoint.y };
+          return { ...point, y: anchorPoint.y };
         }
-        return { x: anchorPoint.x, y: point.y };
+        return { ...point, x: anchorPoint.x };
       }
 
-      function polygonPreviewWithAxisLock(draft, anchorPoint, clientX, clientY, worldX, worldY, shiftKey) {
-        const rawCell = cellFromWorld(worldX, worldY);
+      function polygonPreviewWithAxisLock(draft, anchorPoint, clientX, clientY, worldX, worldY, shiftKey, transform = null) {
+        const rawCell = drawingLocalCellFromWorld(transform, worldX, worldY);
+        const rawWorld = drawingLocalCellCenterWorld(rawCell, transform);
         if (!draft || !anchorPoint) {
           return {
             cell: { x: rawCell.x, y: rawCell.y },
-            world: { x: worldX, y: worldY },
+            world: rawWorld,
           };
         }
         if (!shiftKey) {
           draft.lockedAxis = null;
           return {
             cell: { x: rawCell.x, y: rawCell.y },
-            world: { x: worldX, y: worldY },
+            world: rawWorld,
           };
         }
         const anchorClientX = Number.isFinite(draft.anchorClientX) ? draft.anchorClientX : clientX;
@@ -16239,28 +16559,30 @@
         if (deltaClientX === 0 && deltaClientY === 0) {
           return {
             cell: { x: rawCell.x, y: rawCell.y },
-            world: { x: worldX, y: worldY },
+            world: rawWorld,
           };
         }
         if (!draft.lockedAxis) {
           draft.lockedAxis = Math.abs(deltaClientX) > Math.abs(deltaClientY) ? "x" : "y";
         }
         if (draft.lockedAxis === "x") {
+          const cell = { x: rawCell.x, y: anchorPoint.y };
           return {
-            cell: { x: rawCell.x, y: anchorPoint.y },
-            world: { x: worldX, y: (anchorPoint.y + 0.5) * CELL_SIZE },
+            cell,
+            world: drawingLocalCellCenterWorld(cell, transform),
           };
         }
+        const cell = { x: anchorPoint.x, y: rawCell.y };
         return {
-          cell: { x: anchorPoint.x, y: rawCell.y },
-          world: { x: (anchorPoint.x + 0.5) * CELL_SIZE, y: worldY },
+          cell,
+          world: drawingLocalCellCenterWorld(cell, transform),
         };
       }
 
       function resetBrushAxisLockAnchor(clientX, clientY) {
         if (!state.interaction || state.interaction.type !== "brush") return;
         const pointer = worldFromClient(clientX, clientY);
-        const cell = cellFromWorld(pointer.worldX, pointer.worldY);
+        const cell = drawingLocalCellFromWorld(state.interaction.drawingTransform, pointer.worldX, pointer.worldY);
         state.interaction.anchorClientX = clientX;
         state.interaction.anchorClientY = clientY;
         state.interaction.anchorCellX = cell.x;
@@ -16340,20 +16662,25 @@
           render({ overlay: true });
           return;
         }
+        const measurementTransform = resolveMeasurementDocumentTransform(measurement);
+        const projectionEntry = { transform: measurementTransform };
         const pointer = worldFromClient(clientX, clientY);
-        const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
-        const exists = measurement.points.some((point) => pointsEqual(measurementPointWorld(point), snapped));
+        const snapped = measurementPointFromWorld(
+          { x: pointer.worldX, y: pointer.worldY },
+          {
+            id: "point-" + Math.random().toString(36).slice(2, 9),
+            color: state.color.active,
+          },
+          measurementTransform
+        );
+        const snappedWorld = measurementPointWorld(snapped, projectionEntry);
+        const exists = measurement.points.some((point) => pointsEqual(measurementPointWorld(point, projectionEntry), snappedWorld));
         if (exists) {
           setStatus("Point already exists on this snap point.");
           render({ overlay: true });
           return;
         }
-        measurement.points.push({
-          id: "point-" + Math.random().toString(36).slice(2, 9),
-          x: snapped.x,
-          y: snapped.y,
-          color: state.color.active,
-        });
+        measurement.points.push(snapped);
         commitHistory("Add Measurement Point");
         setStatus("Measurement point added.");
         render({ ui: true, overlay: true });
@@ -16361,11 +16688,13 @@
 
       function commitMeasurementLength(measurement, start, end) {
         if (!measurement || pointsEqual(start, end)) return false;
+        const authoredStart = measurementVertexFromCoordinates(start, measurementPointCoordinates(start));
+        const authoredEnd = measurementVertexFromCoordinates(end, measurementPointCoordinates(end));
         measurement.lengths.push({
           id: "length-" + Math.random().toString(36).slice(2, 9),
-          start,
-          end,
-          meters: measurementLengthMeters(start, end),
+          start: authoredStart,
+          end: authoredEnd,
+          meters: measurementLengthMeters(authoredStart, authoredEnd),
           color: state.color.active,
         });
         commitHistory("Add Measurement Length");
@@ -16375,8 +16704,9 @@
       function beginMeasurementLength(clientX, clientY, shiftKey) {
         const measurement = activeMeasurement();
         if (!measurement || measurement.mode !== "length") return;
+        const measurementTransform = resolveMeasurementDocumentTransform(measurement);
         const pointer = worldFromClient(clientX, clientY);
-        const rawSnapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
+        const rawSnapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, measurementTransform);
 
         if (
           state.measurementDraft &&
@@ -16401,6 +16731,7 @@
         state.interaction = {
           type: "measurement-length-drag",
           measurementId: measurement.id,
+          drawingTransform: measurementTransform,
           start: rawSnapped,
           startClientX: clientX,
           startClientY: clientY,
@@ -16414,8 +16745,9 @@
       function beginMeasurementArea(clientX, clientY, shiftKey) {
         const measurement = activeMeasurement();
         if (!measurement || measurement.mode !== "area") return;
+        const measurementTransform = resolveMeasurementDocumentTransform(measurement);
         const pointer = worldFromClient(clientX, clientY);
-        const rawSnapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
+        const rawSnapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, measurementTransform);
         const draft = state.measurementDraft;
         const now = Date.now();
         const snapped =
@@ -16441,6 +16773,7 @@
           state.measurementDraft = {
             type: "area",
             measurementId: measurement.id,
+            drawingTransform: measurementTransform,
             points: [snapped],
             hover: snapped,
             anchorClientX: clientX,
@@ -16453,7 +16786,7 @@
         }
 
         if (draft.points.length >= 3 && pointsEqual(snapped, draft.points[0])) {
-          const points = draft.points.slice();
+          const points = draft.points.map((point) => measurementVertexFromCoordinates(point, measurementPointCoordinates(point)));
           measurement.areas.push({
             id: "area-" + Math.random().toString(36).slice(2, 9),
             points,
@@ -16469,7 +16802,7 @@
         }
 
         if (isDoubleClick && draft.points.length >= 3) {
-          const points = draft.points.slice();
+          const points = draft.points.map((point) => measurementVertexFromCoordinates(point, measurementPointCoordinates(point)));
           measurement.areas.push({
             id: "area-" + Math.random().toString(36).slice(2, 9),
             points,
@@ -16867,7 +17200,11 @@
         if (!state.interaction) {
           if (state.shapeDraft && state.shapeDraft.type === "shape-click") {
             const pointer = worldFromClient(event.clientX, event.clientY);
-            const cell = cellFromWorld(pointer.worldX, pointer.worldY);
+            const cell = drawingLocalCellFromWorld(
+              state.shapeDraft.drawingTransform || resolveLayerDocumentTransform(state.shapeDraft.layerId),
+              pointer.worldX,
+              pointer.worldY
+            );
             state.shapeDraft.centered = shapeCenteredMode(state.shapeDraft.shapeType, event.shiftKey);
             state.shapeDraft.square = shapeSquareMode(state.shapeDraft.shapeType, event.shiftKey);
             state.shapeDraft.currentCellX = cell.x;
@@ -16883,7 +17220,8 @@
               event.clientY,
               pointer.worldX,
               pointer.worldY,
-              event.shiftKey
+              event.shiftKey,
+              state.shapeDraft.drawingTransform || resolveLayerDocumentTransform(state.shapeDraft.layerId)
             );
             state.shapeDraft.hover = preview.cell;
             state.shapeDraft.hoverWorld = preview.world;
@@ -16928,28 +17266,30 @@
             ui.overlayCanvas.style.cursor = cursorForViewHit(viewTransformHit(activeView(), pointer.worldX, pointer.worldY));
           } else if (state.activeTool === "measure") {
             ui.overlayCanvas.style.cursor = "crosshair";
-          if (
-            state.measurementDraft &&
-            state.measurementDraft.measurementId === state.activeMeasurementId &&
-            (state.measurementDraft.type === "length-click" || state.measurementDraft.type === "area")
-          ) {
-            const pointer = worldFromClient(event.clientX, event.clientY);
-            const rawSnapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
-            const anchorPoint =
-              state.measurementDraft.type === "area"
-                ? state.measurementDraft.points[state.measurementDraft.points.length - 1]
-                : state.measurementDraft.start;
-            const snapped = measurementPointWithAxisLock(
-              state.measurementDraft,
-              anchorPoint,
-              event.clientX,
-              event.clientY,
-              rawSnapped,
-              event.shiftKey
-            );
-            state.measurementDraft.end = snapped;
-            state.measurementDraft.hover = snapped;
-          }
+            if (
+              state.measurementDraft &&
+              state.measurementDraft.measurementId === state.activeMeasurementId &&
+              (state.measurementDraft.type === "length-click" || state.measurementDraft.type === "area")
+            ) {
+              const pointer = worldFromClient(event.clientX, event.clientY);
+              const draftTransform =
+                state.measurementDraft.drawingTransform || resolveMeasurementDocumentTransform(state.measurementDraft.measurementId);
+              const rawSnapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, draftTransform);
+              const anchorPoint =
+                state.measurementDraft.type === "area"
+                  ? state.measurementDraft.points[state.measurementDraft.points.length - 1]
+                  : state.measurementDraft.start;
+              const snapped = measurementPointWithAxisLock(
+                state.measurementDraft,
+                anchorPoint,
+                event.clientX,
+                event.clientY,
+                rawSnapped,
+                event.shiftKey
+              );
+              state.measurementDraft.end = snapped;
+              state.measurementDraft.hover = snapped;
+            }
           } else if (state.activeTool === "brush") {
             ui.overlayCanvas.style.cursor = state.color.eyedropper || state.outline.eyedropper ? "copy" : "crosshair";
           } else if (state.activeTool === "shape") {
@@ -16972,7 +17312,7 @@
 
         if (state.interaction.type === "brush") {
           const pointer = worldFromClient(event.clientX, event.clientY);
-          const rawCell = cellFromWorld(pointer.worldX, pointer.worldY);
+          const rawCell = drawingLocalCellFromWorld(state.interaction.drawingTransform, pointer.worldX, pointer.worldY);
           const cell = brushCellWithAxisLock(state.interaction, event.clientX, event.clientY, rawCell.x, rawCell.y, event.shiftKey);
           const key = cell.x + ":" + cell.y + ":" + state.interaction.mode;
           if (key !== state.interaction.lastKey) {
@@ -17037,13 +17377,13 @@
           const measurement = findMeasurementById(state.interaction.measurementId);
           if (!measurement) return;
           const pointer = worldFromClient(event.clientX, event.clientY);
-          const cell = cellFromWorld(pointer.worldX, pointer.worldY);
+          const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, state.interaction.drawingTransform);
           const locked = axisLockDeltas(
             state.interaction,
             event.clientX,
             event.clientY,
-            cell.x - state.interaction.startCellX,
-            cell.y - state.interaction.startCellY,
+            snapped.x - state.interaction.startPointX,
+            snapped.y - state.interaction.startPointY,
             event.shiftKey
           );
           const deltaX = locked.deltaX;
@@ -17056,7 +17396,7 @@
           }
           state.interaction.deltaX = deltaX;
           state.interaction.deltaY = deltaY;
-          applyMeasurementSnapshot(measurement, moveMeasurementSnapshot(state.interaction.snapshot, deltaX * CELL_SIZE, deltaY * CELL_SIZE));
+          applyMeasurementSnapshot(measurement, moveMeasurementSnapshot(state.interaction.snapshot, deltaX, deltaY));
           render({ overlay: true, ui: true });
           return;
         }
@@ -17067,32 +17407,32 @@
           if (!measurement) return;
           const target = state.interaction.target;
           const pointer = worldFromClient(event.clientX, event.clientY);
+          const authoredMode = state.interaction.drawingTransform ? "drawing-local" : null;
           if (target.kind === "point") {
             const point = measurement.points.find((entry) => entry.id === target.itemId);
             if (!point) return;
-            const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
+            const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, state.interaction.drawingTransform, point);
             const locked = axisLockDeltas(
               state.interaction,
               event.clientX,
               event.clientY,
-              snapped.x - state.interaction.startWorld.x,
-              snapped.y - state.interaction.startWorld.y,
+              snapped.x - state.interaction.startPoint.x,
+              snapped.y - state.interaction.startPoint.y,
               event.shiftKey
             );
-            const nextWorld = {
-              x: state.interaction.startWorld.x + locked.deltaX,
-              y: state.interaction.startWorld.y + locked.deltaY,
+            const nextPoint = {
+              x: state.interaction.startPoint.x + locked.deltaX,
+              y: state.interaction.startPoint.y + locked.deltaY,
             };
-            const current = measurementPointWorld(point);
-            if (!pointsEqual(current, nextWorld)) {
+            const current = measurementPointCoordinates(point);
+            if (!pointsEqual(current, nextPoint)) {
               state.interaction.moved = true;
             }
-            point.x = nextWorld.x;
-            point.y = nextWorld.y;
+            Object.assign(point, measurementPointFromCoordinates(point, nextPoint, authoredMode));
             render({ overlay: true, ui: true });
             return;
           }
-          const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
+          const snapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY, state.interaction.drawingTransform);
           if (target.kind === "length") {
             const length = measurement.lengths.find((entry) => entry.id === target.itemId);
             if (!length) return;
@@ -17101,8 +17441,8 @@
                 state.interaction,
                 event.clientX,
                 event.clientY,
-                snapped.x - state.interaction.startWorld.x,
-                snapped.y - state.interaction.startWorld.y,
+                snapped.x - state.interaction.startPoint.x,
+                snapped.y - state.interaction.startPoint.y,
                 event.shiftKey
               );
               const deltaX = locked.deltaX;
@@ -17110,48 +17450,56 @@
               if (deltaX !== 0 || deltaY !== 0) {
                 state.interaction.moved = true;
               }
-              length.start = measurementVertexPointFromWorld({
-                x: state.interaction.snapshot.start.x + deltaX,
-                y: state.interaction.snapshot.start.y + deltaY,
-              });
-              length.end = measurementVertexPointFromWorld({
-                x: state.interaction.snapshot.end.x + deltaX,
-                y: state.interaction.snapshot.end.y + deltaY,
-              });
+              length.start = measurementVertexFromCoordinates(
+                length.start,
+                {
+                  x: state.interaction.snapshot.start.x + deltaX,
+                  y: state.interaction.snapshot.start.y + deltaY,
+                },
+                authoredMode
+              );
+              length.end = measurementVertexFromCoordinates(
+                length.end,
+                {
+                  x: state.interaction.snapshot.end.x + deltaX,
+                  y: state.interaction.snapshot.end.y + deltaY,
+                },
+                authoredMode
+              );
             } else if (target.part === "start") {
               const locked = axisLockDeltas(
                 state.interaction,
                 event.clientX,
                 event.clientY,
-                snapped.x - state.interaction.startWorld.x,
-                snapped.y - state.interaction.startWorld.y,
+                snapped.x - state.interaction.startPoint.x,
+                snapped.y - state.interaction.startPoint.y,
                 event.shiftKey
               );
-              const nextWorld = {
-                x: state.interaction.startWorld.x + locked.deltaX,
-                y: state.interaction.startWorld.y + locked.deltaY,
+              const nextPoint = {
+                x: state.interaction.startPoint.x + locked.deltaX,
+                y: state.interaction.startPoint.y + locked.deltaY,
               };
-              if (!pointsEqual(length.start, nextWorld)) {
+              if (!pointsEqual(measurementPointCoordinates(length.start), nextPoint)) {
                 state.interaction.moved = true;
               }
-              length.start = measurementVertexPointFromWorld(nextWorld);
+              length.start = measurementVertexFromCoordinates(length.start, nextPoint, authoredMode);
             } else if (target.part === "end") {
               const locked = axisLockDeltas(
                 state.interaction,
                 event.clientX,
                 event.clientY,
-                snapped.x - state.interaction.startWorld.x,
-                snapped.y - state.interaction.startWorld.y,
+                snapped.x - state.interaction.startPoint.x,
+                snapped.y - state.interaction.startPoint.y,
                 event.shiftKey
               );
-              const nextWorld = {
-                x: state.interaction.startWorld.x + locked.deltaX,
-                y: state.interaction.startWorld.y + locked.deltaY,
+              const nextPoint = {
+                x: state.interaction.startPoint.x + locked.deltaX,
+                y: state.interaction.startPoint.y + locked.deltaY,
               };
-              if (!pointsEqual(length.end, nextWorld)) {
+              if (!pointsEqual(measurementPointCoordinates(length.end), nextPoint)) {
                 state.interaction.moved = true;
               }
-              length.end = measurementVertexPointFromWorld(nextWorld);
+              length.end = measurementVertexFromCoordinates(length.end, nextPoint, authoredMode);
             }
             length.meters = measurementLengthMeters(length.start, length.end);
             render({ overlay: true, ui: true });
@@ -17165,8 +17513,8 @@
                 state.interaction,
                 event.clientX,
                 event.clientY,
-                snapped.x - state.interaction.startWorld.x,
-                snapped.y - state.interaction.startWorld.y,
+                snapped.x - state.interaction.startPoint.x,
+                snapped.y - state.interaction.startPoint.y,
                 event.shiftKey
               );
               const deltaX = locked.deltaX;
@@ -17174,29 +17522,37 @@
               if (deltaX !== 0 || deltaY !== 0) {
                 state.interaction.moved = true;
               }
-              area.points = state.interaction.snapshot.map((point) =>
-                measurementVertexPointFromWorld({
-                  x: point.x + deltaX,
-                  y: point.y + deltaY,
-                })
+              area.points = state.interaction.snapshot.map((point, index) =>
+                measurementVertexFromCoordinates(
+                  area.points[index],
+                  {
+                    x: point.x + deltaX,
+                    y: point.y + deltaY,
+                  },
+                  authoredMode
+                )
               );
             } else if (target.part === "vertex") {
               const locked = axisLockDeltas(
                 state.interaction,
                 event.clientX,
                 event.clientY,
-                snapped.x - state.interaction.startWorld.x,
-                snapped.y - state.interaction.startWorld.y,
+                snapped.x - state.interaction.startPoint.x,
+                snapped.y - state.interaction.startPoint.y,
                 event.shiftKey
               );
-              const nextWorld = {
-                x: state.interaction.startWorld.x + locked.deltaX,
-                y: state.interaction.startWorld.y + locked.deltaY,
+              const nextPoint = {
+                x: state.interaction.startPoint.x + locked.deltaX,
+                y: state.interaction.startPoint.y + locked.deltaY,
               };
-              if (!pointsEqual(area.points[target.vertexIndex], nextWorld)) {
+              if (!pointsEqual(measurementPointCoordinates(area.points[target.vertexIndex]), nextPoint)) {
                 state.interaction.moved = true;
               }
-              area.points[target.vertexIndex] = measurementVertexPointFromWorld(nextWorld);
+              area.points[target.vertexIndex] = measurementVertexFromCoordinates(
+                area.points[target.vertexIndex],
+                nextPoint,
+                authoredMode
+              );
             }
             area.squareMeters = measurementAreaSquareMeters(area.points);
             render({ overlay: true, ui: true });
@@ -17226,7 +17582,7 @@
 
         if (state.interaction.type === "shape") {
           const pointer = worldFromClient(event.clientX, event.clientY);
-          const cell = cellFromWorld(pointer.worldX, pointer.worldY);
+          const cell = drawingLocalCellFromWorld(state.interaction.drawingTransform, pointer.worldX, pointer.worldY);
           state.interaction.centered = shapeCenteredMode(state.interaction.shapeType, event.shiftKey);
           state.interaction.square = shapeSquareMode(state.interaction.shapeType, event.shiftKey);
           state.interaction.currentCellX = cell.x;
@@ -17251,7 +17607,11 @@
 
         if (state.interaction.type === "measurement-length-drag") {
           const pointer = worldFromClient(event.clientX, event.clientY);
-          const rawSnapped = measurementVertexFromWorld(pointer.worldX, pointer.worldY);
+          const rawSnapped = measurementVertexFromWorld(
+            pointer.worldX,
+            pointer.worldY,
+            state.interaction.drawingTransform
+          );
           const snapped = measurementPointWithAxisLock(
             state.interaction,
             state.interaction.start,
@@ -17268,6 +17628,7 @@
             state.measurementDraft = {
               type: "length-drag",
               measurementId: state.interaction.measurementId,
+              drawingTransform: state.interaction.drawingTransform,
               start: state.interaction.start,
               end: snapped,
             };
@@ -17460,6 +17821,7 @@
             state.measurementDraft = {
               type: "length-click",
               measurementId: measurement.id,
+              drawingTransform: state.interaction.drawingTransform,
               start: state.interaction.start,
               end: state.interaction.start,
               anchorClientX: state.interaction.startClientX,
@@ -17506,7 +17868,7 @@
           const interaction = state.interaction;
           state.interaction = null;
           const pointer = worldFromClient(event.clientX, event.clientY);
-          const cell = cellFromWorld(pointer.worldX, pointer.worldY);
+          const cell = drawingLocalCellFromWorld(interaction.drawingTransform, pointer.worldX, pointer.worldY);
           interaction.centered = shapeCenteredMode(interaction.shapeType, event.shiftKey);
           interaction.square = shapeSquareMode(interaction.shapeType, event.shiftKey);
           interaction.currentCellX = cell.x;

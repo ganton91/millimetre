@@ -83,7 +83,7 @@
 **Data model:** Painted content ανά layer, κάθε layer σε tiles (`TILE_SIZE × TILE_SIZE`), κάθε tile έχει offscreen canvas + pixel map. Μόνο visible tiles ζωγραφίζονται.
 
 **Main-canvas truth split:** Για vector-first authoring, το renderer πρέπει να κρατά καθαρά ξεχωριστά επίπεδα:
-- `layer.vectorObjects` = document/history truth
+- `layer.vectorObjects` + measurement `points` / `lengths` / `areas` = document/history truth
 - retained vector scene ανά layer = runtime render/query truth σε world space
 - drawing-aware world scene graph = runtime container/query truth για drawings, layers, measurements
 - dirty-region redraw planner = main-canvas repaint planning πάνω από runtime invalidation signals
@@ -91,15 +91,15 @@
 
 **Invariant για το main canvas:** Το `5cm` grid παραμένει snap / measurement / discrete sizing model, αλλά τα vector shapes δεν επιτρέπεται να ξαναγίνουν per-cell display truth. Το render path πρέπει να παραμένει continuous vector-looking, ακόμα κι αν το current display backend είναι raster cache.
 
-**World-scene-graph transition rule:** Το runtime graph πρέπει να έχει explicit drawing containers και transform metadata (`rotation`, `anchor`) ακόμη κι αν το authored layer/vector content παραμένει προσωρινά world-space. Το local-space content cut έρχεται αργότερα· δεν πρέπει να μπλεχτεί πρόωρα με το display cache layer.
+**Drawing-local document rule:** Vectors και measurements αποθηκεύονται authored σε drawing-local coordinates. Legacy world-authored snapshots επιτρέπονται μόνο σαν import/restore input και πρέπει να κανονικοποιούνται deterministic σε drawing-local truth πριν ξαναμπούν στο live document.
 
-**Container-local runtime rule:** Το current runtime graph μπορεί πλέον να κρατά derived local-space retained content για vectors/measurements μέσα σε κάθε drawing container, αλλά αυτό δεν σημαίνει ακόμη ότι το document/history truth έγινε drawing-local. Αυτή η derived local layer δεν πρέπει να συγχέεται με authored document space.
+**World-projection rule:** Το retained world vector scene, τα measurement world-space overlays/hit paths και τα chunk/composite caches είναι projection/runtime truth που παράγεται από το drawing-local document truth. Δεν επιτρέπεται το runtime projection ή το history replay να γίνει render/document authority.
 
 **Scene-backed lookup rule:** Τα βασικά layer/measurement id lookups που τροφοδοτούν active state, ownership resolution και core interaction paths πρέπει να περνάνε πρώτα από τα runtime scene maps (`layerEntriesById`, `measurementEntriesById`) και μόνο fallback σε raw document scans όταν το graph δεν είναι fresh.
 
 **Scene-node query rule:** Selection priority, hover hit resolution και active layer/measurement transform-entry checks στο main content πρέπει να περνάνε από shared scene-node query helpers που πατάνε στο `mainContentSceneState`, όχι από ανεξάρτητα ad-hoc loops ανά caller.
 
-**Legacy tile compatibility rule:** Όσο το legacy tile path παραμένει compatibility-only, επιτρέπεται να μείνει world-space display content κάτω από container-local vector/measurement runtime paths, αρκεί να μη ξαναγίνει main-canvas display truth και να μη καθοδηγεί την αρχιτεκτονική.
+**Legacy tile compatibility rule:** Όσο το legacy tile path παραμένει compatibility-only, επιτρέπεται να μείνει world-space display content κάτω από drawing-local vector/measurement authored paths, αρκεί να μη ξαναγίνει main-canvas display truth και να μη καθοδηγεί την αρχιτεκτονική.
 
 **Dirty invalidation direction:** Τα display caches δεν πρέπει να invalidated μαζικά μόνο από global revision mismatch. Το σωστό direction είναι:
 - per-layer vector dirty chunk spans σε world space από το retained scene

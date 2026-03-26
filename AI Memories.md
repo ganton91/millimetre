@@ -109,36 +109,20 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - full project export/import
   - duplicate layer / duplicate drawing paths
 
-**Κανόνας μετάβασης:** σε αυτό το στάδιο δεν έχει αλλάξει ακόμα το authoring/render behavior. Η αλλαγή είναι σκόπιμα μόνο στη βάση δεδομένων ώστε `Brush` και `Shape` να μπορούν στο επόμενο βήμα να γράφουν σε κοινό vector container χωρίς νέο schema redesign.
+**Τρέχουσα αλήθεια του migration:** το vector path δεν είναι πια schema-only foundation ή authoring mirror. Τα νέα `Brush` / `Shape` writes πηγαίνουν μόνο σε `layer.vectorObjects`, αποθηκεύονται σε drawing-local document space (`space: "drawing-local"`), και το legacy tile path μένει μόνο compatibility content.
 
-### Πρώτο authoring path πάνω στο νέο model
+### Vector authoring model
 
-- Τα `Shape` paint commits γράφουν πλέον **και** σε `layer.vectorObjects`
-- Το shape vector object αποθηκεύει:
-  - `kind: "shape"`
-  - `sourceTool: "shape"`
-  - `shapeType: rect | ellipse | circle | polygon`
-  - `geometry` σε world units
-  - `style` snapshot από current fill/outline settings
-- Το υπάρχον cell paint path παραμένει ενεργό παράλληλα, άρα:
-  - το σημερινό renderer και τα downstream subsystems συνεχίζουν να δουλεύουν
-  - το vector storage λειτουργεί προς το παρόν ως authoring mirror για το επόμενο στάδιο
-- Τα shape vector objects φέρουν πλέον και `compositeMode: "paint" | "erase"`
-- Το erase δεν κάνει ακόμα destructive boolean edits πάνω σε υπάρχοντα vector objects. Καταγράφεται ως ξεχωριστή vector authoring operation για μελλοντικό vector render/resolve stage.
-
-### Brush mirror πάνω στο νέο model
-
-- Τα ολοκληρωμένα `Brush` paint strokes γράφουν πλέον και σε `layer.vectorObjects`
-- Το brush vector object αποθηκεύει:
-  - `kind: "brushStroke"`
-  - `sourceTool: "brush"`
-  - `brushShape`
-  - `brushWidth` / `brushHeight` σε world units
-  - `style` snapshot από τη στιγμή που ξεκινά το stroke
-  - `stamps[]` με world-space bounds για κάθε sampled brush footprint του stroke
-- Το υπάρχον cell brush painting παραμένει ενεργό παράλληλα
-- Και εδώ τα brush vector objects φέρουν `compositeMode: "paint" | "erase"`
-- Το erase αποθηκεύεται ως ξεχωριστή brushStroke operation, όχι ως άμεσο destructive rewrite των προηγούμενων vector strokes.
+- Τα `Shape` και `Brush` authoring commits γράφουν πλέον μόνο σε `layer.vectorObjects`
+- Τα vector objects αποθηκεύουν:
+  - `kind: "shape" | "brushStroke"`
+  - `sourceTool`
+  - `compositeMode: "paint" | "erase"`
+  - geometry / brush stamps σε drawing-local units
+  - `style` snapshot από τη στιγμή του authoring
+- Το erase παραμένει non-destructive vector intent, όχι boolean rewrite πάνω σε παλιότερα objects
+- Restore/import/history restore paths κανονικοποιούν deterministic τα παλιά world-authored vector snapshots σε drawing-local truth πριν χτιστεί το runtime scene
+- Το legacy tile paint path δεν είναι πλέον authoring target για νέα vector πράξη
 
 ### Main canvas — πρώτο vector render cutover
 
@@ -190,8 +174,8 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 
 ### Retained vector scene seam
 
-- Το `layer.vectorObjects` παραμένει το **document/history truth**
-- Το runtime χτίζει πλέον ξεχωριστό retained per-layer vector scene (`layerVectorSceneCache`) με ordered nodes σε world space
+- Τα `layer.vectorObjects` και τα measurement `points` / `lengths` / `areas` είναι πλέον το **document/history truth** σε drawing-local coordinates
+- Το runtime χτίζει retained per-layer world vector scene (`layerVectorSceneCache`) ως projection του authored-local truth σε ordered nodes σε world space
 - Κάθε scene node κρατά:
   - cloned vector object για render/query
   - authored bounds
@@ -202,7 +186,7 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - `layerCompositeRenderCache`
   - `layerChunkRenderCache`
 - Άρα το τωρινό architecture seam είναι:
-  - `document vectorObjects -> retained vector scene -> drawing-aware world scene graph -> dirty-region redraw planner -> raster display cache`
+  - `document drawing-local vectorObjects/measurements -> retained world vector scene + scene-backed local runtime content -> drawing-aware world scene graph -> dirty-region redraw planner -> raster display cache`
 - Αυτό είναι transitional step προς serious vector renderer. Δεν αλλάζει το grid-snapped vector model και δεν επιτρέπει επιστροφή σε per-cell main rendering.
 
 ### Drawing-aware world scene graph + dirty-region redraw planner
@@ -223,9 +207,10 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - `topMeasurementSceneHitAt` / `topPaintedLayerSceneHitAt` για top-first hit order
   - layer / measurement transform-hit helpers που δέχονται scene entries ή raw entities, αλλά προτιμούν το scene graph όταν είναι fresh
 - Το runtime graph δεν κρατά πια μόνο transform metadata:
-  - κάθε `layer` entry κρατά runtime-local vector scene derived από το retained world vector scene
-  - κάθε `measurement` entry κρατά runtime-local snapshot + local bounds
-  - τα vector render/query paths προβάλλουν local content πίσω σε world/chunk space μέσω του drawing transform
+  - κάθε `layer` entry κρατά retained world vector scene για render/query/invalidation
+  - κάθε `layer` entry κρατά και runtime-local vector scene χτισμένο απευθείας από το authored document truth
+  - κάθε `measurement` entry κρατά authored-local snapshot + local bounds χτισμένα απευθείας από το measurement document truth
+  - τα vector render/query paths δουλεύουν σε world projection, ενώ τα measurement/vector authoring and transform paths δουλεύουν στο ίδιο drawing-local model
 - Το draw / warmup / top-layer hit path δεν χρειάζεται πια να ξανασυνθέτει ad-hoc layer order από raw loops κάθε φορά
 - Τα βασικά measurement/layer query paths πατάνε πλέον σε graph child entries αντί για raw `getAll…()` + `findDrawingFor…()` scans σε κάθε pass
 - Κάθε retained layer scene κρατά και:
@@ -236,17 +221,18 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 - Τα legacy tile edits σημαδεύουν ξεχωριστά per-layer dirty chunk keys στο runtime chunk cache, ώστε το compatibility tile path να μπαίνει στον ίδιο redraw planner χωρίς να ξαναγυρνά το main canvas σε per-cell rendering
 - Τα legacy tiles παραμένουν ακόμη world-space compatibility content:
   - δεν έχουν local-space runtime projection όπως τα vectors/measurements
-  - άρα το drawing container-local cut είναι αυτή τη στιγμή strongest στο vector/measurement path, όχι στο legacy tile path
+  - άρα το drawing-local authored cut έχει ολοκληρωθεί για vector/measurement path, όχι ακόμα για το legacy tile path
 - Append-only vector changes μπορούν να κάνουν incremental chunk delta μόνο στα dirty chunks
 - Replace/rewrite vector changes γυρίζουν deterministically σε chunk rebuild μόνο όπου υπάρχει dirty span
 - Το main canvas content repaint δεν κάνει πια υποχρεωτικά full visible-chunk traversal σε κάθε `contentDirty`:
   - αν αλλάξει viewport / canvas size / scene structure / layer opacity signature → full redraw
   - αλλιώς ο planner μαζεύει τα visible dirty chunk keys, τα warmup-ready pending chunk redraws, τα συγχωνεύει σε redraw regions και ξαναζωγραφίζει μόνο αυτά τα regions
 - Αν δεν υπάρχει visible dirty region, το content pass μπορεί να γίνει no-op και να κρατήσει το υπάρχον raster display cache ως έχει
-- Το current local-space cut είναι runtime-derived, όχι document-authored:
-  - `layer.vectorObjects` και measurement data παραμένουν document/history truth σε world-authored coordinates
-  - το runtime φτιάχνει local-space retained content από αυτά και μετά το προβάλλει ξανά σε world space
-- Το επόμενο structural cut είναι να περάσει και το document/history model σε drawing-local authored content, και μετά να φτάσει το legacy tile compatibility path στο ίδιο container model
+- Το authored-local cut πλέον ζει στο document/history model:
+  - νέα και restored vector/measurement δεδομένα αποθηκεύονται drawing-local
+  - restore/import/history restore κανονικοποιούν deterministic legacy world-authored content σε drawing-local truth
+  - retained world scenes, local runtime scenes και display caches είναι projection/cache truth, όχι document truth
+- Το επόμενο structural cut είναι να ενταχθεί και το legacy tile compatibility path στο ίδιο drawing container model (ownership / transforms / query seam) χωρίς να ξαναγίνει display truth
 - Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
 
 ### Basic vector hit model

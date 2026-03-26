@@ -93,7 +93,8 @@
 ~~- Επόμενο structural cut: προαγωγή του retained scene από layer list σε drawing-aware world scene graph με explicit containers / transforms~~
 ~~- Επόμενο cut: deeper ενοποίηση hit-testing / selection / transform handles πάνω σε scene-node queries αντί για remaining ad-hoc scans στα raw arrays~~
 ~~- Επόμενο structural cut: μετάβαση από drawing transform metadata `passthrough` σε πραγματικά local-space / container transforms πάνω στο scene graph~~
-- Επόμενο structural cut: μετάβαση από runtime-derived local-space containers σε drawing-local document/history truth για vectors/measurements, και μετά ένταξη του legacy tile compatibility path στο ίδιο container model
+~~- Επόμενο structural cut: μετάβαση από runtime-derived local-space containers σε drawing-local document/history truth για vectors/measurements~~
+- Επόμενο structural cut: ένταξη του legacy tile compatibility path στο ίδιο drawing container model / ownership / transforms, χωρίς να ξαναγίνει main-canvas display truth
 - Επόμενο μεγάλο cut: display backend πιο vector-native από το current Canvas2D replay/chunk pipeline, χωρίς επιστροφή σε per-cell main rendering
 
 ---
