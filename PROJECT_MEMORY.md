@@ -179,16 +179,18 @@
 - Current state: όταν ένα view intersect-άρει vector-bearing layers, τα canonical grids χτίζονται από shared derived layer geometry cache (`layerDerivedGeometryCache`) και legacy tiles συμμετέχουν μόνο ως compatibility content
 - Νέο runtime seam: per-view documentation geometry cache (`viewDocumentationGeometryCache`) πάνω από το canonical build
   - resolved direction/section metadata + documentation-unit transforms
-  - analytic projected vector primitives για safe filled-shape vector content
-  - sampled projected documentation primitives από derived geometry + legacy compatibility tiles ως fallback
+  - authoritative analytic projected vector primitives για locally safe filled-shape vector content
+  - sampled residual documentation loops/segments από το canonical build αφού αφαιρεθούν μόνο τα authoritative analytic primitives
   - reusable visible loops, cut loops, outline segments, layer outline groups, ground/horizon helpers
 - Consumers: `renderDirectionalViewOutput` και `buildViewPaneDxfContent` διαβάζουν πλέον από το documentation seam αντί να ξαναχτίζουν ad-hoc contours/segments ανά caller
-  - όταν υπάρχει safe analytic projected output, και οι δύο consumers το χρησιμοποιούν σαν shared documentation truth
-  - αλλιώς μένουν στο sampled loops/segments fallback
+  - και οι δύο consumers χρησιμοποιούν το ίδιο mixed documentation truth
+  - analytic projected primitives παραμένουν authoritative όπου είναι locally safe
+  - sampled loops/segments μένουν μόνο για incompatible/conflicted residual content
 - Derived geometry contents: adaptive sampled resolved layer surface + `opGroups` + connected `islands` + `silhouetteLoops` + horizontal/vertical run caches
 - Staged fallback: tile-only views συνεχίζουν να περνούν από το legacy cell/occlusion builder για safety/backwards compatibility
 - Current limitation:
-  - το analytic branch καλύπτει προς το παρόν safe pure-filled `shape` content χωρίς erase / authoring stroke mass / legacy tiles / projected overlap / clipping
-  - complex vector overlap, brush strokes, erase, clipped geometry και side section cuts παραμένουν στο sampled approximation path
-  - το τελικό ζητούμενο παραμένει exact boolean curve output, όχι μόνο staged analytic projected primitives
+  - το global all-or-nothing fallback ανά view έχει σπάσει, αλλά το exact boolean/vector solve δεν έχει ολοκληρωθεί ακόμη
+  - local sampled fallback παραμένει για `brushStroke`, `erase`, `style.noFill`, authoring outline mass, clipped geometry, projected overlap/depth conflicts, side section cuts και legacy compatibility tiles
+  - άρα analytic curves/shapes μπορούν πλέον να επιβιώνουν δίπλα σε incompatible residual content, αλλά όχι ακόμη μέσα στα unresolved local conflict zones
+  - το τελικό ζητούμενο παραμένει exact boolean curve output, όχι μόνο staged authoritative analytic primitives + sampled residual fallback
 - Final target: professional-grade vector documentation outputs με continuous geometry, σωστά outlines, σωστές section cuts και depth/shadow behavior που παράγεται από vector truth και όχι από cell occupancy

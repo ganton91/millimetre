@@ -98,9 +98,10 @@
 ~~- Πρώτος consumer του νέου seam: vector-driven view / documentation pipeline που θα διαβάζει `vectorObjects` + `view.layerConfigs` (`baseElevation`, `height`, `outline`, `excludeFromSectionCut`)~~
 - Follow-up interaction cut: connected-shape selection / transform στο main canvas πάνω στο ίδιο derived geometry seam, χωρίς να χαλάσει το stroke-level undo/redo truth
 - Follow-up compatibility cut: ένταξη του legacy tile compatibility path στο ίδιο drawing container model / ownership / transforms, χωρίς να ξαναγίνει main-canvas display truth
-- Follow-up documentation cut: broaden το νέο analytic branch του `viewDocumentationGeometryCache` πέρα από τα σημερινά safe pure-filled `shape` cases
-  - target follow-ups: brush strokes, erase, authoring-outline mass, clipped geometry στα όρια του view, overlapping/vector boolean visibility, side section cuts
-  - long-term target: retire το sampled contour fallback για vector-authored documentation outputs όπου υπάρχει exact vector/boolean solve
+- Follow-up documentation cut: εξέλιξη του νέου hybrid branch του `viewDocumentationGeometryCache` από local authoritative analytics + sampled residual σε exact vector/boolean documentation solve
+  - current staged state: safe pure-filled `shape` entities μπορούν ήδη να μένουν analytic δίπλα σε incompatible residual content, χωρίς global fallback ανά view
+  - next target follow-ups: brush strokes, erase, authoring-outline mass, clipped geometry στα όρια του view, projected overlap/depth conflicts, side section cuts
+  - long-term target: retire το sampled residual fallback για vector-authored documentation outputs όπου υπάρχει exact vector/boolean solve
 - Επόμενο μεγάλο cut: display backend πιο vector-native από το current Canvas2D replay/chunk pipeline, χωρίς επιστροφή σε per-cell main rendering
 
 ---

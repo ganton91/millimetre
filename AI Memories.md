@@ -251,15 +251,17 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 - Πάνω από το shared derived geometry seam υπάρχει πλέον και runtime-only per-view documentation geometry seam (`viewDocumentationGeometryCache`):
   - cache per view + direction/section πάνω από το current hybrid occlusion build
   - κρατά resolved documentation metadata (`isPlanLike`, plane/front-boundary resolution, doc unit size)
-  - κρατά staged projected documentation primitives:
-    - analytic projected vector primitives για safe pure-filled `shape` content
-    - sampled projected primitives από derived geometry + legacy tiles ως compatibility fallback
+  - κρατά mixed documentation output:
+    - authoritative analytic projected vector primitives για locally safe pure-filled `shape` content
+    - sampled residual loops/segments που μένουν αφού αφαιρεθούν μόνο τα authoritative analytic primitives από το canonical occlusion build
   - κρατά reusable visible/cut loops, outline segments, layer-outline groups, ground masks και horizon intervals
   - render/export consumers δεν ξαναχτίζουν ad-hoc contours από το raw grid σε κάθε caller
 - Πρώτοι direct consumers του νέου view documentation seam:
   - `renderDirectionalViewOutput`
   - `buildViewPaneDxfContent`
-  - και οι δύο διαβάζουν πλέον shared prebuilt documentation geometry και κάνουν dispatch σε analytic projected primitives όπου είναι safe, αλλιώς στο sampled documentation fallback
+  - και οι δύο διαβάζουν πλέον shared prebuilt documentation geometry και κάνουν mixed resolve:
+    - analytic projected primitives όπου είναι locally safe
+    - sampled residual loops/segments μόνο για το incompatible/conflicted remainder
 - Η ένταξη του legacy tile compatibility path στο ίδιο drawing container model παραμένει follow-up compatibility cut, όχι το αμέσως επόμενο βήμα
 - Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
 
@@ -275,15 +277,16 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - vector-bearing layers περνούν από derived geometry cache σε adaptive sampled view grids
   - legacy tile-only views μένουν προσωρινά στο παλιό builder για compatibility
 - Το documentation path έχει πλέον δικό του reusable runtime seam:
-  - analytic projected vector primitives για safe filled shape cases
-  - sampled projected/documentation primitives πάνω από το shared derived geometry ως compatibility path
+  - authoritative analytic projected vector primitives για locally safe filled shape cases
+  - sampled residual documentation loops/segments πάνω από το shared derived geometry για incompatible/conflicted content
   - resolved visible/cut/outlines/horizon entities για render + DXF consumers
   - καθαρός διαχωρισμός ανάμεσα σε view documentation truth (runtime/cache) και document/history truth
 - Σημερινός περιορισμός του documentation path:
-  - το analytic documentation branch καλύπτει προς το παρόν safe vector cases: pure-filled `shape` objects, χωρίς erase, χωρίς authoring stroke mass, χωρίς legacy tiles, χωρίς projected overlap/clipping
-  - `Plan` / `Z sections` και safe non-section side elevations μπορούν πλέον να διαβάζουν από analytic projected primitives για render + DXF
-  - brush strokes, erase, clipped geometry, overlapping projected content, side section cuts και legacy compatibility cases παραμένουν στο sampled fallback
-  - το final target παραμένει exact boolean/vector documentation output, όχι μόνο staged analytic islands πάνω από sampled visibility solve
+  - το documentation seam δεν είναι πια global all-or-nothing ανά view· το fallback σπάει πλέον local/per-entity
+  - authoritative analytic branch: pure-filled `shape` objects που είναι locally safe μέσα στο current view solve
+  - local sampled fallback παραμένει για: `brushStroke`, `erase`, `style.noFill`, authoring outline mass (`outlineWidthCells > 0`), clipped geometry στα όρια του view, projected overlap/depth conflict, side section cuts και legacy tile compatibility content
+  - `Plan` / `Z sections` και safe non-section side elevations μπορούν πλέον να κρατούν analytic curves/shapes ακόμα κι όταν αλλού στο ίδιο view υπάρχει incompatible residual content
+  - το final target παραμένει exact boolean/vector documentation output, όχι μόνο staged analytic islands πάνω από sampled residual solve
 
 ### Basic vector hit model
 
