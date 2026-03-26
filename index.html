@@ -5912,6 +5912,7 @@
           build: { error: "no-view" },
           renderGrid: [],
           visibleGrid: [],
+          analyticProjectedRenderable: false,
           projectedPrimitives: [],
           projectedSectionPrimitives: [],
           fillGroups: [],
@@ -5936,6 +5937,12 @@
           horizonGapIntervals: [],
           docUnitWorldSize: CELL_SIZE,
         };
+      }
+
+      function layerHasLegacyTileContent(layer) {
+        if (!layer || typeof layer !== "object") return false;
+        if ((layer.cellCount || 0) > 0) return true;
+        return Object.values(layer.tiles || {}).some((tile) => tile?.pixels?.size);
       }
 
       function viewDocumentationBoundsSignature(view) {
@@ -6052,6 +6059,372 @@
         };
       }
 
+      function documentationProjectWorldPoint(worldX, worldY, request, build) {
+        const unitWorldSize = documentationUnitWorldSize(build);
+        if (request.isPlanLike) {
+          return {
+            x: worldX / unitWorldSize - build.contentMinProjectedColumn,
+            y: build.contentMaxProjectedRow - worldY / unitWorldSize,
+          };
+        }
+        return {
+          x: worldX / unitWorldSize - build.contentMinProjectedColumn,
+          y: build.contentMaxZ - worldY / unitWorldSize,
+        };
+      }
+
+      function documentationGeometryBoundsRect(geometry) {
+        return vectorObjectBoundsRect({ geometry });
+      }
+
+      function projectWorldBoundsToDocumentationBounds(bounds, request, build) {
+        if (!bounds) return null;
+        const corners = [
+          documentationProjectWorldPoint(bounds.minX, bounds.minY, request, build),
+          documentationProjectWorldPoint(bounds.maxX, bounds.minY, request, build),
+          documentationProjectWorldPoint(bounds.maxX, bounds.maxY, request, build),
+          documentationProjectWorldPoint(bounds.minX, bounds.maxY, request, build),
+        ];
+        return {
+          minX: Math.min(...corners.map((point) => point.x)),
+          minY: Math.min(...corners.map((point) => point.y)),
+          maxX: Math.max(...corners.map((point) => point.x)),
+          maxY: Math.max(...corners.map((point) => point.y)),
+        };
+      }
+
+      function projectWorldGeometryToDocumentationGeometry(geometry, request, build) {
+        if (!geometry || typeof geometry !== "object") return null;
+        const unitWorldSize = documentationUnitWorldSize(build);
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          const bounds = projectWorldBoundsToDocumentationBounds(geometry.bounds, request, build);
+          return bounds ? { ...geometry, bounds } : null;
+        }
+        if (geometry.type === "orientedRect") {
+          return {
+            ...geometry,
+            center: documentationProjectWorldPoint(geometry.center.x, geometry.center.y, request, build),
+            width: geometry.width / unitWorldSize,
+            height: geometry.height / unitWorldSize,
+            rotation: request.isPlanLike ? normalizeAngle(-(geometry.rotation || 0)) : geometry.rotation || 0,
+          };
+        }
+        if (geometry.type === "orientedEllipse") {
+          return {
+            ...geometry,
+            center: documentationProjectWorldPoint(geometry.center.x, geometry.center.y, request, build),
+            radiusX: geometry.radiusX / unitWorldSize,
+            radiusY: geometry.radiusY / unitWorldSize,
+            rotation: request.isPlanLike ? normalizeAngle(-(geometry.rotation || 0)) : geometry.rotation || 0,
+          };
+        }
+        if (geometry.type === "circle") {
+          return {
+            ...geometry,
+            center: documentationProjectWorldPoint(geometry.center.x, geometry.center.y, request, build),
+            radius: geometry.radius / unitWorldSize,
+          };
+        }
+        if (geometry.type === "polygon" && Array.isArray(geometry.points)) {
+          return {
+            ...geometry,
+            points: geometry.points.map((point) => documentationProjectWorldPoint(point.x, point.y, request, build)),
+          };
+        }
+        return null;
+      }
+
+      function geometryWorldPrimaryInterval(geometry, directionConfig) {
+        const rect = documentationGeometryBoundsRect(geometry);
+        if (!rect) return null;
+        return directionConfig.primaryAxis === "x" ? [rect.left, rect.right] : [rect.top, rect.bottom];
+      }
+
+      function geometryIntersectsDirectionalFrontBoundary(geometry, directionConfig, frontBoundaryWorld) {
+        if (!Number.isFinite(frontBoundaryWorld)) return false;
+        const rect = documentationGeometryBoundsRect(geometry);
+        if (!rect) return false;
+        const depthMinWorld = directionConfig.depthAxis === "x" ? rect.left : rect.top;
+        const depthMaxWorld = directionConfig.depthAxis === "x" ? rect.right : rect.bottom;
+        return depthMinWorld < frontBoundaryWorld && frontBoundaryWorld < depthMaxWorld;
+      }
+
+      function projectSideIntervalToDocumentationGeometry(interval, baseWorld, topWorld, build) {
+        if (!Array.isArray(interval) || interval.length < 2) return null;
+        const unitWorldSize = documentationUnitWorldSize(build);
+        const minPrimary = Math.min(interval[0], interval[1]);
+        const maxPrimary = Math.max(interval[0], interval[1]);
+        if (!(maxPrimary > minPrimary) || !(topWorld > baseWorld)) return null;
+        return {
+          type: "rect",
+          bounds: {
+            minX: minPrimary / unitWorldSize - build.contentMinProjectedColumn,
+            minY: build.contentMaxZ - topWorld / unitWorldSize,
+            maxX: maxPrimary / unitWorldSize - build.contentMinProjectedColumn,
+            maxY: build.contentMaxZ - baseWorld / unitWorldSize,
+          },
+        };
+      }
+
+      function documentationPrimitiveBounds(primitive) {
+        return primitive?.bounds || documentationGeometryBoundsRect(primitive?.geometry);
+      }
+
+      function documentationBoundsOverlap(a, b) {
+        if (!a || !b) return false;
+        const left = Math.max(a.left, b.left);
+        const top = Math.max(a.top, b.top);
+        const right = Math.min(a.right, b.right);
+        const bottom = Math.min(a.bottom, b.bottom);
+        return right - left > 1e-6 && bottom - top > 1e-6;
+      }
+
+      function documentationPrimitivesOverlap(primitives) {
+        for (let index = 0; index < primitives.length; index += 1) {
+          const current = primitives[index];
+          const currentBounds = documentationPrimitiveBounds(current);
+          if (!currentBounds) continue;
+          for (let compareIndex = index + 1; compareIndex < primitives.length; compareIndex += 1) {
+            const compare = primitives[compareIndex];
+            if (current.sourceKey === compare.sourceKey) continue;
+            if (documentationBoundsOverlap(currentBounds, documentationPrimitiveBounds(compare))) return true;
+          }
+        }
+        return false;
+      }
+
+      function createDocumentationProjectedPrimitive(base, geometry) {
+        if (!geometry) return null;
+        const bounds = documentationGeometryBoundsRect(geometry);
+        if (!bounds || !(bounds.right > bounds.left) || !(bounds.bottom > bounds.top)) return null;
+        return {
+          ...base,
+          geometry,
+          bounds,
+        };
+      }
+
+      function buildAnalyticDocumentationProjectedPrimitives(request) {
+        const build = request.build;
+        if (build?.error || !request.view) {
+          return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+        }
+        const viewRect = viewBoundsWorldRect(request.view);
+        if (!viewRect) {
+          return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+        }
+        const directionConfig = build.directionConfig || directionalViewConfig(request.resolvedDirection);
+        const unitWorldSize = documentationUnitWorldSize(build);
+        const planeWorld = request.isPlanLike ? worldUnitsFromMeters(snapViewElevationMeters(Number(build.planeElevation))) : null;
+        const frontBoundaryWorld = request.isPlanLike
+          ? null
+          : directionalFrontBoundaryWorld(viewRect, directionConfig, request.frontBoundaryOverride);
+        const projectedPrimitives = [];
+        const projectedSectionPrimitives = [];
+        const combinedPrimitives = [];
+        let hasAnalyticSource = false;
+        let unsupported = false;
+
+        for (const { layer, config } of request.configuredLayers) {
+          if (layerHasLegacyTileContent(layer)) {
+            return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+          }
+
+          const transform = resolveLayerDocumentTransform(layer);
+          const scene = ensureLayerVectorScene(layer, transform);
+          if (!scene.nodes.length) continue;
+          if (
+            scene.nodes.some((node) => {
+              const style = node.vectorObject?.style || {};
+              return (
+                node.compositeMode === "erase" ||
+                node.vectorObject?.kind !== "shape" ||
+                !node.vectorObject?.geometry ||
+                style.noFill ||
+                typeof style.fillColor !== "string" ||
+                Number(style.outlineWidthCells || 0) > 0
+              );
+            })
+          ) {
+            return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+          }
+
+          const baseWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.baseElevation)));
+          const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
+          const topWorld = baseWorld + heightWorld;
+          if (!(heightWorld > 0)) continue;
+
+          scene.paintNodeIndices.forEach((nodeIndex) => {
+            const node = scene.nodes[nodeIndex];
+            const geometry = node.vectorObject?.geometry;
+            const worldBounds = documentationGeometryBoundsRect(geometry);
+            if (!worldBounds) return;
+            if (
+              worldBounds.left < viewRect.left - 1e-6 ||
+              worldBounds.top < viewRect.top - 1e-6 ||
+              worldBounds.right > viewRect.right + 1e-6 ||
+              worldBounds.bottom > viewRect.bottom + 1e-6
+            ) {
+              unsupported = true;
+              return;
+            }
+
+            hasAnalyticSource = true;
+            const basePrimitive = {
+              layerId: layer.id,
+              sourceKey: layer.id + ":" + node.id,
+              orderIndex: node.order,
+              color: state.viewColorOverride ? config.color || layerRepresentativeColor(layer) : node.vectorObject?.style?.fillColor || config.color,
+              sourceColor: node.vectorObject?.style?.fillColor || config.color,
+              opacity: Math.max(0, Math.min(1, state.viewColorOverride ? config.opacity : layer.opacity)),
+              forceOutline: !!config.outline,
+              outlineColor: config.outlineColor || state.viewOutlineEffect.color,
+              outlineWidth: Math.max(1, Math.min(12, Math.round(Number(config.outlineWidth) || 1))),
+              excludeFromSectionCut: !!config.excludeFromSectionCut,
+              isCut: false,
+              isCutGeometry: false,
+              depth: 0,
+            };
+
+            if (request.isPlanLike) {
+              if (baseWorld > planeWorld) return;
+              const cutOnPlane = planeWorld >= baseWorld && planeWorld < topWorld;
+              const geometryDoc = projectWorldGeometryToDocumentationGeometry(geometry, request, build);
+              const primitive = createDocumentationProjectedPrimitive(
+                {
+                  ...basePrimitive,
+                  depth: Math.min(topWorld, planeWorld) / unitWorldSize,
+                  isCut: cutOnPlane && !config.excludeFromSectionCut,
+                  isCutGeometry: cutOnPlane,
+                },
+                geometryDoc
+              );
+              if (!primitive) {
+                unsupported = true;
+                return;
+              }
+              combinedPrimitives.push(primitive);
+              if (cutOnPlane && !config.excludeFromSectionCut) {
+                projectedSectionPrimitives.push(primitive);
+              } else {
+                projectedPrimitives.push(primitive);
+              }
+              return;
+            }
+
+            if (request.sectionInfo) {
+              unsupported = true;
+              return;
+            }
+            if (geometryIntersectsDirectionalFrontBoundary(geometry, directionConfig, frontBoundaryWorld)) {
+              unsupported = true;
+              return;
+            }
+            const interval = geometryWorldPrimaryInterval(geometry, directionConfig);
+            if (!interval) return;
+            const geometryDoc = projectSideIntervalToDocumentationGeometry(interval, baseWorld, topWorld, build);
+            const primitive = createDocumentationProjectedPrimitive(
+              {
+                ...basePrimitive,
+                depth:
+                  (directionConfig.depthAxis === "x"
+                    ? directionConfig.frontBoundary === "min"
+                      ? worldBounds.left
+                      : worldBounds.right
+                    : directionConfig.frontBoundary === "min"
+                    ? worldBounds.top
+                    : worldBounds.bottom) / unitWorldSize,
+              },
+              geometryDoc
+            );
+            if (!primitive) {
+              unsupported = true;
+              return;
+            }
+            projectedPrimitives.push(primitive);
+            combinedPrimitives.push(primitive);
+          });
+          if (unsupported) return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+        }
+
+        if (unsupported || !hasAnalyticSource || !combinedPrimitives.length || documentationPrimitivesOverlap(combinedPrimitives)) {
+          return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+        }
+
+        projectedPrimitives.sort((a, b) => a.orderIndex - b.orderIndex || a.sourceKey.localeCompare(b.sourceKey));
+        projectedSectionPrimitives.sort((a, b) => a.orderIndex - b.orderIndex || a.sourceKey.localeCompare(b.sourceKey));
+        return {
+          projectedPrimitives,
+          projectedSectionPrimitives,
+          analyticProjectedRenderable: true,
+        };
+      }
+
+      function buildSampledDocumentationProjectedPrimitives(request) {
+        const build = request.build;
+        if (build?.error || !request.view) {
+          return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+        }
+        const viewRect = viewBoundsWorldRect(request.view);
+        if (!viewRect) return { projectedPrimitives: [], projectedSectionPrimitives: [], analyticProjectedRenderable: false };
+        const projectedPrimitives = [];
+        const projectedSectionPrimitives = [];
+        const directionConfig = build.directionConfig || directionalViewConfig(request.resolvedDirection);
+        const frontBoundaryWorld = request.isPlanLike
+          ? null
+          : directionalFrontBoundaryWorld(viewRect, directionConfig, request.frontBoundaryOverride);
+        const planeWorld = request.isPlanLike
+          ? worldUnitsFromMeters(snapViewElevationMeters(Number(build.planeElevation)))
+          : null;
+        const orientation = request.isPlanLike
+          ? "horizontal"
+          : directionConfig.primaryAxis === "x"
+          ? "horizontal"
+          : "vertical";
+
+        request.configuredLayers.forEach(({ layer, config }, orderIndex) => {
+          const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
+          if (heightWorld <= 0) return;
+          const baseWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.baseElevation)));
+          const topWorld = baseWorld + heightWorld;
+          const cutOnPlane = request.isPlanLike
+            ? planeWorld >= baseWorld && planeWorld < topWorld
+            : null;
+          forEachLayerViewRect(layer, orientation, viewRect, (rect, sourceColor) => {
+            const docRect = projectWorldRectToDocumentationRect(rect, request, build, baseWorld, topWorld);
+            if (!docRect || docRect.right <= docRect.left || docRect.bottom <= docRect.top) return;
+            let isCutGeometry = false;
+            if (request.isPlanLike) {
+              isCutGeometry = !!cutOnPlane;
+            } else {
+              const depthMinWorld = directionConfig.depthAxis === "x" ? rect.left : rect.top;
+              const depthMaxWorld = directionConfig.depthAxis === "x" ? rect.right : rect.bottom;
+              isCutGeometry = directionConfig.frontBoundary === "min"
+                ? depthMinWorld <= frontBoundaryWorld && frontBoundaryWorld < depthMaxWorld
+                : depthMinWorld < frontBoundaryWorld && frontBoundaryWorld <= depthMaxWorld;
+            }
+            const primitive = {
+              layerId: layer.id,
+              orderIndex,
+              color: state.viewColorOverride ? config.color || layerRepresentativeColor(layer) : sourceColor,
+              sourceColor,
+              opacity: Math.max(0, Math.min(1, state.viewColorOverride ? config.opacity : layer.opacity)),
+              forceOutline: !!config.outline,
+              outlineColor: config.outlineColor || state.viewOutlineEffect.color,
+              outlineWidth: Math.max(1, Math.min(12, Math.round(Number(config.outlineWidth) || 1))),
+              excludeFromSectionCut: !!config.excludeFromSectionCut,
+              isCut: !config.excludeFromSectionCut && isCutGeometry,
+              isCutGeometry,
+              rect: docRect,
+            };
+            projectedPrimitives.push(primitive);
+            if (primitive.isCutGeometry) projectedSectionPrimitives.push(primitive);
+          });
+        });
+
+        return { projectedPrimitives, projectedSectionPrimitives, analyticProjectedRenderable: false };
+      }
+
       function resolveViewDocumentationRequest(view, direction) {
         if (!view) {
           return {
@@ -6140,68 +6513,9 @@
       }
 
       function buildViewDocumentationProjectedPrimitives(request) {
-        const build = request.build;
-        if (build?.error || !request.view) {
-          return { projectedPrimitives: [], projectedSectionPrimitives: [] };
-        }
-        const viewRect = viewBoundsWorldRect(request.view);
-        if (!viewRect) return { projectedPrimitives: [], projectedSectionPrimitives: [] };
-        const projectedPrimitives = [];
-        const projectedSectionPrimitives = [];
-        const directionConfig = build.directionConfig || directionalViewConfig(request.resolvedDirection);
-        const frontBoundaryWorld = request.isPlanLike
-          ? null
-          : directionalFrontBoundaryWorld(viewRect, directionConfig, request.frontBoundaryOverride);
-        const planeWorld = request.isPlanLike
-          ? worldUnitsFromMeters(snapViewElevationMeters(Number(build.planeElevation)))
-          : null;
-        const orientation = request.isPlanLike
-          ? "horizontal"
-          : directionConfig.primaryAxis === "x"
-          ? "horizontal"
-          : "vertical";
-
-        request.configuredLayers.forEach(({ layer, config }, orderIndex) => {
-          const heightWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.height), { allowNegative: false }));
-          if (heightWorld <= 0) return;
-          const baseWorld = worldUnitsFromMeters(snapViewElevationMeters(Number(config.baseElevation)));
-          const topWorld = baseWorld + heightWorld;
-          const cutOnPlane = request.isPlanLike
-            ? planeWorld >= baseWorld && planeWorld < topWorld
-            : null;
-          forEachLayerViewRect(layer, orientation, viewRect, (rect, sourceColor) => {
-            const docRect = projectWorldRectToDocumentationRect(rect, request, build, baseWorld, topWorld);
-            if (!docRect || docRect.right <= docRect.left || docRect.bottom <= docRect.top) return;
-            let isCutGeometry = false;
-            if (request.isPlanLike) {
-              isCutGeometry = !!cutOnPlane;
-            } else {
-              const depthMinWorld = directionConfig.depthAxis === "x" ? rect.left : rect.top;
-              const depthMaxWorld = directionConfig.depthAxis === "x" ? rect.right : rect.bottom;
-              isCutGeometry = directionConfig.frontBoundary === "min"
-                ? depthMinWorld <= frontBoundaryWorld && frontBoundaryWorld < depthMaxWorld
-                : depthMinWorld < frontBoundaryWorld && frontBoundaryWorld <= depthMaxWorld;
-            }
-            const primitive = {
-              layerId: layer.id,
-              orderIndex,
-              color: state.viewColorOverride ? config.color || layerRepresentativeColor(layer) : sourceColor,
-              sourceColor,
-              opacity: Math.max(0, Math.min(1, state.viewColorOverride ? config.opacity : layer.opacity)),
-              forceOutline: !!config.outline,
-              outlineColor: config.outlineColor || state.viewOutlineEffect.color,
-              outlineWidth: Math.max(1, Math.min(12, Math.round(Number(config.outlineWidth) || 1))),
-              excludeFromSectionCut: !!config.excludeFromSectionCut,
-              isCut: !config.excludeFromSectionCut && isCutGeometry,
-              isCutGeometry,
-              rect: docRect,
-            };
-            projectedPrimitives.push(primitive);
-            if (primitive.isCutGeometry) projectedSectionPrimitives.push(primitive);
-          });
-        });
-
-        return { projectedPrimitives, projectedSectionPrimitives };
+        const analytic = buildAnalyticDocumentationProjectedPrimitives(request);
+        if (analytic.analyticProjectedRenderable) return analytic;
+        return buildSampledDocumentationProjectedPrimitives(request);
       }
 
       function buildViewSectionCutFillGroups(renderGrid, cutColor) {
@@ -6358,6 +6672,7 @@
         cache.nearestVisibleDepth = Number.isFinite(nearestVisibleDepth) ? nearestVisibleDepth : 0;
 
         const projected = buildViewDocumentationProjectedPrimitives(request);
+        cache.analyticProjectedRenderable = !!projected.analyticProjectedRenderable;
         cache.projectedPrimitives = projected.projectedPrimitives;
         cache.projectedSectionPrimitives = projected.projectedSectionPrimitives;
         cache.fillGroups = buildViewVectorFillGroups(renderGrid, cache.nearestVisibleDepth, build.directionConfig);
@@ -6740,6 +7055,119 @@
         );
       }
 
+      function documentationIdentityProjectPoint(x, y) {
+        return { x, y };
+      }
+      documentationIdentityProjectPoint.rotationAngle = 0;
+
+      function documentationProjectedPrimitiveFillStyle(primitive, documentation) {
+        const directionConfig = documentation?.build?.directionConfig || directionalViewConfig(documentation?.resolvedDirection || "plan");
+        const nearestVisibleDepth = Number.isFinite(documentation?.nearestVisibleDepth) ? documentation.nearestVisibleDepth : 0;
+        const baseColor =
+          typeof primitive?.color === "string"
+            ? primitive.color
+            : typeof primitive?.sourceColor === "string"
+            ? primitive.sourceColor
+            : DEFAULT_COLOR;
+        const depthOffset =
+          directionConfig.frontBoundary === "min"
+            ? (primitive?.depth || 0) - nearestVisibleDepth
+            : nearestVisibleDepth - (primitive?.depth || 0);
+        return hexToRgba(applyViewDepthShading(baseColor, depthOffset), Math.max(0, Math.min(1, primitive?.opacity ?? 1)));
+      }
+
+      function fillDocumentationProjectedPrimitive(ctx, primitive, documentation) {
+        if (!primitive?.geometry) return false;
+        if (!drawVectorGeometryPath(ctx, primitive.geometry, documentationIdentityProjectPoint, 1)) return false;
+        ctx.fillStyle = documentationProjectedPrimitiveFillStyle(primitive, documentation);
+        ctx.fill();
+        return true;
+      }
+
+      function strokeDocumentationProjectedPrimitive(ctx, primitive, strokeStyle, lineWidth) {
+        if (!primitive?.geometry) return false;
+        if (!drawVectorGeometryPath(ctx, primitive.geometry, documentationIdentityProjectPoint, 1)) return false;
+        ctx.strokeStyle = strokeStyle;
+        ctx.lineWidth = lineWidth;
+        ctx.lineJoin = "miter";
+        ctx.stroke();
+        return true;
+      }
+
+      function documentationCurveSegmentCount(radius) {
+        const safeRadius = Math.max(1, Number(radius) || 0);
+        return Math.max(32, Math.min(144, Math.ceil((Math.PI * 2 * safeRadius) / 2)));
+      }
+
+      function sampleDocumentationEllipsePoints(center, radiusX, radiusY, rotation = 0) {
+        const segments = documentationCurveSegmentCount(Math.max(radiusX, radiusY));
+        const points = [];
+        for (let index = 0; index < segments; index += 1) {
+          const angle = (index / segments) * Math.PI * 2;
+          const localX = Math.cos(angle) * radiusX;
+          const localY = Math.sin(angle) * radiusY;
+          const rotated = rotatePoint(localX, localY, rotation);
+          points.push({
+            x: center.x + rotated.x,
+            y: center.y + rotated.y,
+          });
+        }
+        return points;
+      }
+
+      function documentationGeometryToPolylinePoints(geometry) {
+        if (!geometry || typeof geometry !== "object") return [];
+        if (geometry.type === "rect" || geometry.type === "ellipse") {
+          const bounds = geometry.bounds;
+          if (!bounds) return [];
+          if (geometry.type === "rect") {
+            return [
+              { x: bounds.minX, y: bounds.minY },
+              { x: bounds.maxX, y: bounds.minY },
+              { x: bounds.maxX, y: bounds.maxY },
+              { x: bounds.minX, y: bounds.maxY },
+            ];
+          }
+          return sampleDocumentationEllipsePoints(
+            { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 },
+            Math.max(0, (bounds.maxX - bounds.minX) / 2),
+            Math.max(0, (bounds.maxY - bounds.minY) / 2)
+          );
+        }
+        if (geometry.type === "orientedRect") {
+          return orientedRectCorners(geometry);
+        }
+        if (geometry.type === "orientedEllipse") {
+          return sampleDocumentationEllipsePoints(
+            geometry.center,
+            Math.max(0, geometry.radiusX || 0),
+            Math.max(0, geometry.radiusY || 0),
+            geometry.rotation || 0
+          );
+        }
+        if (geometry.type === "circle") {
+          return sampleDocumentationEllipsePoints(
+            geometry.center,
+            Math.max(0, geometry.radius || 0),
+            Math.max(0, geometry.radius || 0),
+            0
+          );
+        }
+        if (geometry.type === "polygon" && Array.isArray(geometry.points)) {
+          return geometry.points.map((point) => ({ x: point.x, y: point.y }));
+        }
+        return [];
+      }
+
+      function encodeDocumentationGeometryPolyline(layerName, geometry, documentation) {
+        const points = documentationGeometryToPolylinePoints(geometry);
+        if (points.length < 3) return "";
+        return encodeDxfPolyline(
+          layerName,
+          points.map((point) => documentationPointToMeters(point, documentation))
+        );
+      }
+
       function buildViewPaneDxfContent(slotIndex) {
         const view = activeCanvasView();
         if (!view) return { error: "no-view" };
@@ -6748,10 +7176,33 @@
         const build = documentation.build;
         const isPlanLike = documentation.isPlanLike;
         if (build.error) return { error: build.error };
-        const hasVisibleCells = documentation.visibleGrid.some((row) => row.some(Boolean));
+        const hasVisibleCells = documentation.analyticProjectedRenderable
+          ? documentation.projectedPrimitives.length > 0 || documentation.projectedSectionPrimitives.length > 0
+          : documentation.visibleGrid.some((row) => row.some(Boolean));
         if (!hasVisibleCells) return { error: "no-entities" };
 
         let entities = "";
+        if (documentation.analyticProjectedRenderable) {
+          documentation.projectedPrimitives.forEach((primitive) => {
+            entities += encodeDocumentationGeometryPolyline("VIEW_VISIBLE", primitive.geometry, documentation);
+          });
+
+          documentation.projectedSectionPrimitives.forEach((primitive) => {
+            entities += encodeDocumentationGeometryPolyline("VIEW_SECTION_CUT", primitive.geometry, documentation);
+          });
+
+          if (state.viewOutlineEffect.enabled) {
+            documentation.projectedPrimitives.forEach((primitive) => {
+              entities += encodeDocumentationGeometryPolyline("VIEW_OUTLINE_GLOBAL", primitive.geometry, documentation);
+            });
+          }
+
+          documentation.projectedPrimitives
+            .filter((primitive) => primitive.forceOutline)
+            .forEach((primitive) => {
+              entities += encodeDocumentationGeometryPolyline("VIEW_OUTLINE_LAYER", primitive.geometry, documentation);
+            });
+        } else {
         documentation.visibleLoops.forEach((loop) => {
           entities += encodeDxfPolyline("VIEW_VISIBLE", documentationLoopToMeters(loop, documentation));
         });
@@ -6779,6 +7230,7 @@
             meters.end
           );
         });
+        }
 
         if (!isPlanLike && state.viewEnvironment.horizonEnabled) {
           const gridUnitsPerMeter = build.gridUnitsPerMeter || CELLS_PER_METER;
@@ -6944,6 +7396,8 @@
         const renderGrid = documentation.renderGrid;
         const renderRows = totalRows;
         const renderColumns = contentColumns;
+        const planeElevation = documentation.planeElevation;
+        const useAnalyticProjectedPrimitives = !!documentation.analyticProjectedRenderable;
 
         canvas.classList.remove("hidden");
         emptyState.classList.add("hidden");
@@ -7014,8 +7468,17 @@
         // Row where z=0 sits in cell-space (boundary between above-ground and underground)
         const undergroundStartRow = contentMaxZ;
 
-        // === Background (sky only for side views — plan background is handled by ground overlay) ===
-        if (!isPlanLike) {
+        // === Background ===
+        if (isPlanLike && useAnalyticProjectedPrimitives) {
+          const planBackgroundEnabled = planeElevation >= 0 ? state.viewEnvironment.planGroundEnabled : state.viewEnvironment.planUndergroundEnabled;
+          if (planBackgroundEnabled) {
+            context.save();
+            context.setTransform(drawRatio, 0, 0, drawRatio, 0, 0);
+            context.fillStyle = planeElevation >= 0 ? activeViewPlanGroundColor() : activeViewPlanUndergroundColor();
+            context.fillRect(0, 0, surfaceWidth, surfaceHeight);
+            context.restore();
+          }
+        } else if (!isPlanLike) {
           context.save();
           context.setTransform(drawRatio, 0, 0, drawRatio, 0, 0);
           context.fillStyle = activeViewSkyColor();
@@ -7023,21 +7486,43 @@
           context.restore();
         }
 
-        // === Vector fills (non-cut cells grouped by depth-shaded fill style) ===
+        // === Vector fills ===
         {
           context.save();
-          for (const group of documentation.fillGroups) {
-            context.beginPath();
-            for (const loop of group.loops) applyViewContourPath(context, loop);
-            context.fillStyle = group.fillStyle;
-            context.fill("evenodd");
+          if (useAnalyticProjectedPrimitives) {
+            documentation.projectedPrimitives.forEach((primitive) => {
+              fillDocumentationProjectedPrimitive(context, primitive, documentation);
+            });
+          } else {
+            for (const group of documentation.fillGroups) {
+              context.beginPath();
+              for (const loop of group.loops) applyViewContourPath(context, loop);
+              context.fillStyle = group.fillStyle;
+              context.fill("evenodd");
+            }
           }
           context.restore();
         }
 
         // === Per-layer outlines — pass 1: normal layers (not excluded from section cut) ===
         {
-          if (documentation.layerOutlinePass1.length) {
+          if (useAnalyticProjectedPrimitives) {
+            const outlinedPrimitives = documentation.projectedPrimitives.filter(
+              (primitive) => primitive.forceOutline && !primitive.excludeFromSectionCut
+            );
+            if (outlinedPrimitives.length) {
+              context.save();
+              outlinedPrimitives.forEach((primitive) => {
+                strokeDocumentationProjectedPrimitive(
+                  context,
+                  primitive,
+                  primitive.outlineColor || state.viewOutlineEffect.color,
+                  px(primitive.outlineWidth || 1)
+                );
+              });
+              context.restore();
+            }
+          } else if (documentation.layerOutlinePass1.length) {
             context.save();
             for (const group of documentation.layerOutlinePass1) {
               context.beginPath();
@@ -7054,7 +7539,19 @@
 
         // === Section cut fills ===
         {
-          if (documentation.sectionCutFillGroups.length) {
+          if (useAnalyticProjectedPrimitives) {
+            const cutFillColor = state.viewSectionCutEffect.color || defaultViewSectionCutColor();
+            if (documentation.projectedSectionPrimitives.length) {
+              context.save();
+              documentation.projectedSectionPrimitives.forEach((primitive) => {
+                if (!primitive?.geometry) return;
+                if (!drawVectorGeometryPath(context, primitive.geometry, documentationIdentityProjectPoint, 1)) return;
+                context.fillStyle = hexToRgba(cutFillColor, Math.max(0, Math.min(1, primitive.opacity ?? 1)));
+                context.fill();
+              });
+              context.restore();
+            }
+          } else if (documentation.sectionCutFillGroups.length) {
             context.save();
             for (const group of documentation.sectionCutFillGroups) {
               context.beginPath();
@@ -7065,10 +7562,6 @@
             context.restore();
           }
         }
-
-        // planeElevation and planHoleMask hoisted here so pass 2 outlines can use them
-        const planeElevation = documentation.planeElevation;
-
         // === Ground ===
         {
           // Extend enough cells to always cover the full canvas regardless of zoom/pan
@@ -7084,7 +7577,7 @@
             context.fillStyle = activeViewGroundColor();
             context.fill("evenodd");
             context.restore();
-          } else if (isPlanLike) {
+          } else if (isPlanLike && !useAnalyticProjectedPrimitives) {
             if (planeElevation >= 0 && state.viewEnvironment.planGroundEnabled) {
               // Ground plan: punch holes where planHoleMask is set (isCut walls + enclosed empties)
               // AND where any painted cell has depth > 0 (geometry above z=0 but below cut plane).
@@ -7144,23 +7637,29 @@
           const outlineThickness = Math.max(1, Number(state.viewOutlineEffect.thickness) || 1);
           const outlineColor = state.viewOutlineEffect.color;
 
-          // Mass boundary: outer contour of all visible non-cut filled cells
-          if (documentation.globalMassLoops.length) {
-            context.beginPath();
-            for (const loop of documentation.globalMassLoops) applyViewContourPath(context, loop);
-            context.strokeStyle = outlineColor;
-            context.lineWidth = px(outlineThickness);
-            context.lineJoin = "miter";
-            context.stroke();
-          }
+          if (useAnalyticProjectedPrimitives) {
+            documentation.projectedPrimitives.forEach((primitive) => {
+              strokeDocumentationProjectedPrimitive(context, primitive, outlineColor, px(outlineThickness));
+            });
+          } else {
+            // Mass boundary: outer contour of all visible non-cut filled cells
+            if (documentation.globalMassLoops.length) {
+              context.beginPath();
+              for (const loop of documentation.globalMassLoops) applyViewContourPath(context, loop);
+              context.strokeStyle = outlineColor;
+              context.lineWidth = px(outlineThickness);
+              context.lineJoin = "miter";
+              context.stroke();
+            }
 
-          // Depth transitions: segments where adjacent visible non-cut cells have different depth values
-          if (documentation.globalDepthSegments.length) {
-            applyDocumentationSegmentsPath(context, documentation.globalDepthSegments);
-            context.strokeStyle = outlineColor;
-            context.lineWidth = px(outlineThickness);
-            context.lineCap = "square";
-            context.stroke();
+            // Depth transitions: segments where adjacent visible non-cut cells have different depth values
+            if (documentation.globalDepthSegments.length) {
+              applyDocumentationSegmentsPath(context, documentation.globalDepthSegments);
+              context.strokeStyle = outlineColor;
+              context.lineWidth = px(outlineThickness);
+              context.lineCap = "square";
+              context.stroke();
+            }
           }
 
           context.restore();
@@ -7170,7 +7669,15 @@
         if (state.viewSectionCutOutlineEffect.enabled) {
           const cutOutlineColor = state.viewSectionCutOutlineEffect.color || defaultViewSectionCutOutlineColor();
           const cutOutlineThickness = Math.max(1, Number(state.viewSectionCutOutlineEffect.thickness) || 1);
-          if (documentation.sectionCutOutlineLoops.length) {
+          if (useAnalyticProjectedPrimitives) {
+            if (documentation.projectedSectionPrimitives.length) {
+              context.save();
+              documentation.projectedSectionPrimitives.forEach((primitive) => {
+                strokeDocumentationProjectedPrimitive(context, primitive, cutOutlineColor, px(cutOutlineThickness));
+              });
+              context.restore();
+            }
+          } else if (documentation.sectionCutOutlineLoops.length) {
             context.save();
             context.beginPath();
             for (const loop of documentation.sectionCutOutlineLoops) applyViewContourPath(context, loop);
@@ -7184,7 +7691,23 @@
 
         // === Per-layer outlines — pass 2: excluded-from-section-cut layers (on top of ground + section cut) ===
         {
-          if (documentation.layerOutlinePass2.length) {
+          if (useAnalyticProjectedPrimitives) {
+            const outlinedPrimitives = documentation.projectedPrimitives.filter(
+              (primitive) => primitive.forceOutline && primitive.excludeFromSectionCut
+            );
+            if (outlinedPrimitives.length) {
+              context.save();
+              outlinedPrimitives.forEach((primitive) => {
+                strokeDocumentationProjectedPrimitive(
+                  context,
+                  primitive,
+                  primitive.outlineColor || state.viewOutlineEffect.color,
+                  px(primitive.outlineWidth || 1)
+                );
+              });
+              context.restore();
+            }
+          } else if (documentation.layerOutlinePass2.length) {
             context.save();
             for (const group of documentation.layerOutlinePass2) {
               context.beginPath();
