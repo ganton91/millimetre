@@ -114,6 +114,9 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
 ### Vector authoring model
 
 - Τα `Shape` και `Brush` authoring commits γράφουν πλέον μόνο σε `layer.vectorObjects`
+- Κάθε ολοκληρωμένο brush gesture γίνεται **ένα** `vectorObject` τύπου `brushStroke` που περιέχει πολλά `stamps`
+- Αν ο χρήστης κάνει 3 brush strokes που ακουμπάνε μεταξύ τους, το document truth παραμένει 3 ξεχωριστά vector objects
+- Οποιοδήποτε μελλοντικό merge σε ενιαίο silhouette / shape island πρέπει να γίνει σαν **derived runtime geometry**, όχι σαν destructive rewrite του stroke history
 - Τα vector objects αποθηκεύουν:
   - `kind: "shape" | "brushStroke"`
   - `sourceTool`
@@ -232,8 +235,24 @@ layer/measurement active → Escape → deactivate layer/measurement, drawing π
   - νέα και restored vector/measurement δεδομένα αποθηκεύονται drawing-local
   - restore/import/history restore κανονικοποιούν deterministic legacy world-authored content σε drawing-local truth
   - retained world scenes, local runtime scenes και display caches είναι projection/cache truth, όχι document truth
-- Το επόμενο structural cut είναι να ενταχθεί και το legacy tile compatibility path στο ίδιο drawing container model (ownership / transforms / query seam) χωρίς να ξαναγίνει display truth
+- Το επόμενο structural cut δεν είναι άμεσο ξήλωμα caches ή history merge. Είναι shared derived layer geometry seam πάνω από τα `layer.vectorObjects`:
+  - connected islands / silhouettes
+  - style-aware και composite-aware grouping
+  - runtime-only, όχι document truth
+  - first consumer = vector-driven view / documentation pipeline
+  - later consumer = connected-shape selection / transform μέσα στο main canvas
+- Η ένταξη του legacy tile compatibility path στο ίδιο drawing container model παραμένει follow-up compatibility cut, όχι το αμέσως επόμενο βήμα
 - Το main canvas παραμένει ακόμα raster display cache, αλλά το invalidation logic έχει πλέον αποσυνδεθεί ουσιαστικά από το history replay model και δουλεύει σαν retained-scene-driven redraw planning
+
+### Product target — documentation-first vector engine
+
+- Ο πραγματικός product στόχος του Milimetre δεν είναι μόνο vector-looking main canvas
+- Ο στόχος είναι professional-grade documentation από τα `View Boxes`: plans / elevations / sections που να βγαίνουν από vector-driven geometry, όχι από staircase cell truth
+- Το τωρινό main-canvas vector migration είναι υποδομή για αυτό:
+  - σωστό authored truth
+  - σωστό retained scene/runtime truth
+  - και αργότερα σωστό view projection truth
+- Τα views σήμερα παραμένουν cell/occlusion-grid driven, άρα οι κύκλοι / διαγώνιες / smooth outlines δεν έχουν ακόμα περάσει στο documentation pipeline
 
 ### Basic vector hit model
 

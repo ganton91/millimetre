@@ -89,15 +89,26 @@
 - dirty-region redraw planner = main-canvas repaint planning πάνω από runtime invalidation signals
 - chunk/composite canvases = display cache μόνο
 
+**Product target rule:** Το Milimetre είναι measured infinite drawing canvas με τελικό σκοπό professional-grade documentation από τα `View Boxes`. Το vector migration του main canvas δεν είναι αυτοσκοπός· υπάρχει για να τροφοδοτήσει plan / elevation / section outputs με clean vector geometry, σωστά outlines και σωστή depth/shadow logic.
+
 **Invariant για το main canvas:** Το `5cm` grid παραμένει snap / measurement / discrete sizing model, αλλά τα vector shapes δεν επιτρέπεται να ξαναγίνουν per-cell display truth. Το render path πρέπει να παραμένει continuous vector-looking, ακόμα κι αν το current display backend είναι raster cache.
 
 **Drawing-local document rule:** Vectors και measurements αποθηκεύονται authored σε drawing-local coordinates. Legacy world-authored snapshots επιτρέπονται μόνο σαν import/restore input και πρέπει να κανονικοποιούνται deterministic σε drawing-local truth πριν ξαναμπούν στο live document.
+
+**Stroke-vs-derived rule:** Κάθε `Brush` gesture παραμένει ξεχωριστό `vectorObject` στο document/history truth, ακόμα κι αν ακουμπά άλλα strokes. Τυχόν merge σε ενιαίο silhouette / connected shape πρέπει να γίνεται μόνο σε derived runtime geometry, ώστε να μη σπάει το undo/redo stroke history.
 
 **World-projection rule:** Το retained world vector scene, τα measurement world-space overlays/hit paths και τα chunk/composite caches είναι projection/runtime truth που παράγεται από το drawing-local document truth. Δεν επιτρέπεται το runtime projection ή το history replay να γίνει render/document authority.
 
 **Scene-backed lookup rule:** Τα βασικά layer/measurement id lookups που τροφοδοτούν active state, ownership resolution και core interaction paths πρέπει να περνάνε πρώτα από τα runtime scene maps (`layerEntriesById`, `measurementEntriesById`) και μόνο fallback σε raw document scans όταν το graph δεν είναι fresh.
 
 **Scene-node query rule:** Selection priority, hover hit resolution και active layer/measurement transform-entry checks στο main content πρέπει να περνάνε από shared scene-node query helpers που πατάνε στο `mainContentSceneState`, όχι από ανεξάρτητα ad-hoc loops ανά caller.
+
+**Shared derived geometry rule:** Το επόμενο runtime seam πάνω από τα raw `layer.vectorObjects` πρέπει να είναι per-layer derived geometry cache:
+- connected islands / silhouettes
+- style-aware + composite-aware grouping
+- shared consumer 1 = vector-driven views / documentation
+- shared consumer 2 = future connected-shape selection / transform στο main canvas
+- derived/cache truth μόνο, ποτέ document/history rewrite
 
 **Legacy tile compatibility rule:** Όσο το legacy tile path παραμένει compatibility-only, επιτρέπεται να μείνει world-space display content κάτω από drawing-local vector/measurement authored paths, αρκεί να μη ξαναγίνει main-canvas display truth και να μη καθοδηγεί την αρχιτεκτονική.
 
@@ -165,4 +176,6 @@
 - `buildDirectionalOcclusionGrid(view, direction)`: canonical projected/occlusion grid για side views
 - `buildPlanOcclusionGrid(view)`: canonical grid για plan views
 - Debug: `DEBUG_VIEW_VECTOR_CONTOURS` (default off)
-- Limitation: geometry από 5cm base grid — fully continuous vector edges not yet implemented
+- Current limitation: τα views παραμένουν cell/occlusion-grid driven, άρα circles / diagonals / smooth silhouettes βγαίνουν ακόμα staircase
+- Next view cut: vector-driven view geometry builder που θα διαβάζει `layer.vectorObjects` + `view.layerConfigs` (`baseElevation`, `height`, `outline`, `excludeFromSectionCut`, κ.λπ.)
+- Final target: professional-grade vector documentation outputs με continuous geometry, σωστά outlines, σωστές section cuts και depth/shadow behavior που παράγεται από vector truth και όχι από cell occupancy
